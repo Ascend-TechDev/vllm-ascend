@@ -35,6 +35,11 @@ from vllm_ascend.device.mxfp_compat import (
 from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.quantization.mxfp8_rotation import (
+    apply_mxfp8_block_rotation,
+    get_mxfp8_rotation_config,
+    validate_mxfp8_rotation_config,
+)
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -54,7 +59,17 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
     def __init__(self):
         ensure_mxfp8_linear_available("W8A8_MXFP8 linear quantization")
         vllm_config = get_current_vllm_config()
-        self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
+        quant_description = vllm_config.quant_config.quant_description
+        self.group_size = quant_description.get("group_size", 32)
+        self.rotation_config = get_mxfp8_rotation_config(quant_description)
+        validate_mxfp8_rotation_config(self.rotation_config, group_size=self.group_size)
+        if self.rotation_config.enable:
+            logger.info_once(
+                "MXFP8 block rotation enabled for dynamic linear: kind=%s, block_size=%s, seed=%s",
+                self.rotation_config.kind,
+                self.rotation_config.block_size,
+                self.rotation_config.seed,
+            )
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn)}

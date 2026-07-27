@@ -12,6 +12,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEWeights,
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.quantization.quant_type import QuantType
 
 MXFP4_TEST_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.float16)
@@ -247,6 +248,52 @@ class TestUnifiedApplyMlpRequest(unittest.TestCase):
         self.assertEqual(quant_kwargs["activation"], MoEActivation.SWIGLUSTEP)
         self.assertEqual(quant_kwargs["swiglu_limit"], 5.0)
         mock_unquant.assert_not_called()
+
+    @patch("vllm_ascend.ops.fused_moe.moe_mlp.apply_mxfp8_block_rotation")
+    @patch("vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.get_quant_gmm2_kwargs")
+    @patch("vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.npu_dynamic_quant")
+    @patch("vllm_ascend.ops.fused_moe.moe_mlp.torch_npu")
+    def test_rotated_mxfp8_swiglu_quant_rotates_before_dynamic_quant(
+        self, mock_torch_npu, mock_dynamic_quant, mock_get_quant_kwargs, mock_rotate
+    ):
+        from vllm_ascend.ops.fused_moe.moe_mlp import _apply_rotated_mxfp8_swiglu_quant
+
+        rotation_config = MXFP8RotationConfig(enable=True, block_size=32, seed=9)
+        hidden_states = torch.randn(4, 32, dtype=torch.bfloat16)
+        swiglu_out = torch.randn(4, 32, dtype=torch.bfloat16)
+        mock_get_quant_kwargs.return_value = {"output_dtype": torch.bfloat16}
+        mock_torch_npu.npu_grouped_matmul.return_value = (torch.randn(4, 64, dtype=torch.bfloat16),)
+        mock_torch_npu.npu_swiglu.return_value = swiglu_out
+        mock_rotate.side_effect = lambda tensor, config: tensor + 1
+
+        def fake_dynamic_quant(*, hidden_states, dynamic_scale, act_quant_type, use_mxfp_quant):
+            self.assertTrue(use_mxfp_quant)
+            self.assertTrue(torch.allclose(hidden_states, swiglu_out + 1))
+            return hidden_states, torch.ones((4, 1), dtype=torch.uint8)
+
+        mock_dynamic_quant.side_effect = fake_dynamic_quant
+
+        rotated_hidden_states, swiglu_scale = _apply_rotated_mxfp8_swiglu_quant(
+            hidden_states=hidden_states,
+            w1=torch.randn(1, 64, 32, dtype=torch.bfloat16),
+            w1_scale=torch.ones(1, 64, 1, dtype=torch.uint8),
+            group_list=torch.tensor([2, 2], dtype=torch.int64),
+            group_list_type=1,
+            pertoken_scale=torch.ones(4, 1, dtype=torch.uint8),
+            input_hidden_dtype=torch.bfloat16,
+            act_quant_type=torch.float8_e4m3fn,
+            weight_quant_type=torch.float8_e4m3fn,
+            scale_type=None,
+            per_token_scale_type=None,
+            use_bf16=True,
+            swiglu_limit=0,
+            rotation_config=rotation_config,
+        )
+
+        self.assertTrue(torch.allclose(rotated_hidden_states, swiglu_out + 1))
+        self.assertEqual(swiglu_scale.shape, (4, 1))
+        mock_rotate.assert_called_once()
+        self.assertEqual(mock_rotate.call_args.args[0].shape, (4, 32))
 
 
 if __name__ == "__main__":

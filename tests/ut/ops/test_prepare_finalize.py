@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -9,6 +10,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
 )
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 class TestPrepareAndFinalize(unittest.TestCase):
@@ -215,3 +217,32 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         result_with_tp = layer.finalize(h_out, reduce_results=True)
         self.assertEqual(result_with_tp.shape[0], 3)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.apply_mxfp8_block_rotation")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_current_vllm_config")
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    def test_all2all_mxfp8_prepare_rotates_before_comm(
+        self, mock_tp_rank, mock_tp_size, mock_get_current_vllm_config, mock_rotate
+    ):
+        mock_get_current_vllm_config.return_value = SimpleNamespace(
+            quant_config=SimpleNamespace(
+                quant_description={
+                    "group_size": 32,
+                    "mxfp8_rotation_enable": True,
+                    "mxfp8_rotation_kind": "block_hadamard_sign",
+                    "mxfp8_rotation_block_size": 32,
+                    "mxfp8_rotation_seed": 5,
+                }
+            )
+        )
+        mock_rotate.side_effect = lambda tensor, config: tensor + 1
+
+        layer = PrepareAndFinalizeWithAll2All(self.moe_config)
+        hidden_states = torch.randn(3, 32)
+        router_logits = torch.randn(3, 2)
+
+        prepare_output = layer.prepare(hidden_states, router_logits, quant_type=QuantType.MXFP8)
+
+        mock_rotate.assert_called_once()
+        self.assertTrue(torch.allclose(prepare_output.hidden_states, hidden_states + 1))

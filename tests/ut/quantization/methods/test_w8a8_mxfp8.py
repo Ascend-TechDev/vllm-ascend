@@ -9,6 +9,7 @@ from tests.ut.quantization.conftest_quantization import (
     create_mock_vllm_config,
     create_mxfp_moe_layer,
 )
+from vllm_ascend.quantization.mxfp8_rotation import MXFP8RotationConfig
 from vllm_ascend.quantization.methods.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicFusedMoEMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
@@ -81,6 +82,38 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(output.shape, (32, 1, 128))
         call_kwargs = mock_torch_npu.npu_quant_matmul.call_args.kwargs
         self.assertEqual(call_kwargs["bias"].dtype, torch.float32)
+        self.assertEqual(call_kwargs["group_sizes"], [1, 1, self.scheme.group_size])
+        self.assertEqual(call_kwargs["scale_dtype"], FLOAT8_E8M0FNU_DTYPE)
+        self.assertEqual(call_kwargs["output_dtype"], torch.float16)
+
+    @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.apply_mxfp8_block_rotation")
+    @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.torch_npu")
+    def test_apply_rotates_activation_before_dynamic_quant(self, mock_torch_npu, mock_rotate):
+        from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
+
+        self.scheme.rotation_config = MXFP8RotationConfig(enable=True, block_size=32, seed=13)
+        x = torch.randn(32, 1, 256, dtype=torch.float16)
+        rotated_x = x.view(-1, x.shape[-1]) + 1
+        mock_rotate.side_effect = lambda tensor, config: tensor + 1
+        dynamic_scale = torch.randint(0, 255, (32, 8), dtype=torch.uint8)
+
+        def fake_dynamic_mx_quant(tensor, dst_type):
+            self.assertTrue(torch.allclose(tensor, rotated_x))
+            return torch.randint(0, 255, (32, 256), dtype=torch.uint8), dynamic_scale
+
+        mock_torch_npu.npu_dynamic_mx_quant.side_effect = fake_dynamic_mx_quant
+        mock_torch_npu.npu_quant_matmul.return_value = torch.randn(32, 128, dtype=torch.float16)
+
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.randn(256, 128).to(torch.float8_e4m3fn), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.randint(0, 255, (4, 128, 2), dtype=torch.uint8), requires_grad=False)
+        bias = torch.randn(128, dtype=torch.float16)
+        output = self.scheme.apply(layer, x, bias)
+
+        self.assertEqual(output.shape, (32, 1, 128))
+        self.assertEqual(mock_rotate.call_count, 1)
+        self.assertEqual(mock_rotate.call_args_list[0].args[0].shape, (32, 256))
+        call_kwargs = mock_torch_npu.npu_quant_matmul.call_args.kwargs
         self.assertEqual(call_kwargs["group_sizes"], [1, 1, self.scheme.group_size])
         self.assertEqual(call_kwargs["scale_dtype"], FLOAT8_E8M0FNU_DTYPE)
         self.assertEqual(call_kwargs["output_dtype"], torch.float16)
