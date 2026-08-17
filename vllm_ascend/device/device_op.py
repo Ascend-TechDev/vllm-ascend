@@ -93,6 +93,11 @@ class BaseDeviceAdaptor:
                 is_prefill_no_cache=is_prefill_no_cache,
             )
 
+        if key is not None:
+            key = key.contiguous()
+        if value is not None:
+            value = value.contiguous()
+
         return torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
@@ -881,6 +886,10 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         is_prefill_no_cache: bool,
         **kwargs,
     ):
+        if key is not None:
+            key = key.contiguous()
+        if value is not None:
+            value = value.contiguous()
         return torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
