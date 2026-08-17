@@ -118,6 +118,17 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(call_kwargs["scale_dtype"], FLOAT8_E8M0FNU_DTYPE)
         self.assertEqual(call_kwargs["output_dtype"], torch.float16)
 
+    def test_apply_rejects_prequantized_input_when_rotation_enabled(self):
+        self.scheme.rotation_config = MXFP8RotationConfig(enable=True, block_size=32, seed=13)
+        layer = nn.Module()
+        layer.weight = nn.Parameter(torch.randn(256, 128).to(torch.float8_e4m3fn), requires_grad=False)
+        layer.weight_scale = nn.Parameter(torch.randint(0, 255, (4, 128, 2), dtype=torch.uint8), requires_grad=False)
+        quantized_x = torch.randint(0, 255, (32, 256), dtype=torch.uint8)
+        pertoken_scale = torch.randint(0, 255, (32, 8), dtype=torch.uint8)
+
+        with self.assertRaisesRegex(ValueError, "rotation must run before activation quantization"):
+            self.scheme.apply(layer, (quantized_x, pertoken_scale))
+
 
 class TestAscendW8A8MXFP8MoEMethod(TestBase):
     num_experts = 8
