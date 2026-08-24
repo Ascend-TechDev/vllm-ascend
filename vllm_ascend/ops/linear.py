@@ -41,6 +41,12 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
+from vllm_ascend.quantization.mxfp8_fake_quant import (
+    fake_quant_mxfp8_activation,
+    fake_quant_mxfp8_weight,
+    is_mxfp8_fake_quant_enabled,
+    should_fake_quantize_layer,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -86,15 +92,18 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         keep_nd_weight = _should_keep_nd_for_310p_weight(layer.weight.data)
+        fake_quant_enabled = is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(
+            getattr(layer, "prefix", "")
+        )
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
             weight_fp32 = layer.weight.data.to(torch.float32)
-            layer.weight_fp32 = weight_fp32 if keep_nd_weight else maybe_trans_nz(weight_fp32)
+            layer.weight_fp32 = weight_fp32 if keep_nd_weight or fake_quant_enabled else maybe_trans_nz(weight_fp32)
         if "conv1d" not in layer.prefix:
             # 310P torch_npu rejects FRACTAL_NZ matmul when the weight-side
             # matrix has n=1 or k=1. Keep scalar gates such as Qwen MoE's
             # shared_expert_gate in ND format, leaving non-310P policy intact.
-            if not keep_nd_weight:
+            if not keep_nd_weight and not fake_quant_enabled:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
 
     def apply(
@@ -103,7 +112,12 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
+        if is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(getattr(layer, "prefix", "")):
+            x = fake_quant_mxfp8_activation(x)
+            weight = fake_quant_mxfp8_weight(layer.weight)
+        else:
+            weight = layer.weight
+        return torch.ops.vllm.unquantized_gemm(x, weight, bias)
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group

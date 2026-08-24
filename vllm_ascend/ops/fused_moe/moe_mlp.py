@@ -29,6 +29,11 @@ from vllm_ascend.device.mxfp_compat import (
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.quantization.mxfp8_fake_quant import (
+    fake_quant_mxfp8_activation,
+    fake_quant_mxfp8_transposed_moe_weight,
+    is_mxfp8_fake_quant_enabled,
+)
 from vllm_ascend.quantization.mxfp8_rotation import (
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
@@ -504,9 +509,17 @@ def unquant_apply_mlp(
     expanded_row_idx: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    fake_quant_enabled = is_mxfp8_fake_quant_enabled()
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
+
+    if fake_quant_enabled:
+        hidden_states = fake_quant_mxfp8_activation(hidden_states)
+        # vLLM's unquantized grouped matmul stores expert weights as [E, K, N],
+        # while verl QAT quantizes canonical linear weights as [E, N, K].
+        w1 = fake_quant_mxfp8_transposed_moe_weight(w1)
+        w2 = fake_quant_mxfp8_transposed_moe_weight(w2)
 
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -559,6 +572,9 @@ def unquant_apply_mlp(
             gate.clamp_(max=swiglu_limit)
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+    if fake_quant_enabled:
+        gate_up_out = fake_quant_mxfp8_activation(gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales

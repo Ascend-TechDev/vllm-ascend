@@ -110,6 +110,37 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Enable rollout-side MXFP8 fake quant/dequant in high-precision linear/MoE paths.
+    # Used by low-precision RL rollout on devices without native MXFP8 kernels.
+    "VLLM_ASCEND_QAT_FAKE_QUANT": lambda: bool(int(os.getenv("VLLM_ASCEND_QAT_FAKE_QUANT", "0"))),
+    # Fake quant mode: "w8a16_mxfp8" quantizes weights only; "w8a8_mxfp8" quantizes weights and activations.
+    "VLLM_ASCEND_QAT_FAKE_QUANT_MODE": lambda: os.getenv("VLLM_ASCEND_QAT_FAKE_QUANT_MODE", "w8a8_mxfp8"),
+    # MXFP8 backend recorded for compatibility with verl QAT config. Fake quant uses the torch formula.
+    "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND", "torch"),
+    # MXFP8 fake quant rounding: "rint", "round", "random", or "hash".
+    "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE", "rint"),
+    # MXFP8 fake quant group size. The current implementation requires 32.
+    "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": lambda: int(os.getenv("VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE", "32")),
+    # Enable block-wise Hadamard/random-sign rotation before MXFP8 fake quant.
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": lambda: bool(
+        os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE", "false").lower() in {"1", "true", "yes", "y", "on"}
+    ),
+    # Rotation kind. Currently supports "block_hadamard_sign".
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": lambda: os.getenv(
+        "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND", "block_hadamard_sign"
+    ),
+    # Rotation block size. Must match the MXFP8 group size.
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE", "32")
+    ),
+    # Deterministic random-sign seed for MXFP8 rotation.
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": lambda: int(
+        os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED", "0")
+    ),
+    # JSON-encoded QAT ignore patterns copied from verl's effective QAT configuration.
+    "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": lambda: os.getenv(
+        "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS", "[]"
+    ),
 }
 
 # end-env-vars-definition
