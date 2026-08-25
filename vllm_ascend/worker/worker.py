@@ -112,11 +112,8 @@ class NPUWorker(WorkerBase):
         # Resolve rollout fake-QAT settings before torch.compile captures the
         # model. The compiled forward must only read plain constants/tensors.
         from vllm_ascend.quantization.mxfp8_fake_quant import initialize_mxfp8_fake_quant_config
-        from vllm_ascend.quantization.mxfp8_fake_quant import strip_checkpoint_quantization_config
 
         fake_quant_config = initialize_mxfp8_fake_quant_config()
-        if fake_quant_config.enable:
-            strip_checkpoint_quantization_config(vllm_config.model_config)
 
         # Register ops when worker init.
         from vllm_ascend import ops
