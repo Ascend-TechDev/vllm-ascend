@@ -25,8 +25,6 @@ from __future__ import annotations
 import json
 import re
 import threading
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,7 +34,7 @@ from vllm.logger import logger
 from vllm_ascend import envs
 from vllm_ascend.quantization.mxfp8_rotation import (
     MXFP8RotationConfig,
-    apply_mxfp8_block_rotation,
+    _build_block_rotation_matrix,
     validate_mxfp8_rotation_config,
 )
 
@@ -53,9 +51,16 @@ _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
 _LOGGED_KEYS: set[tuple[Any, ...]] = set()
 _LOG_LOCK = threading.Lock()
-_FAKE_QUANT_LAYER_OVERRIDE: ContextVar[bool | None] = ContextVar(
-    "mxfp8_fake_quant_layer_override", default=None
-)
+
+_RUNTIME_FAKE_QUANT_ENABLED = False
+_RUNTIME_MODE = "w8a8_mxfp8"
+_RUNTIME_QUANT_BACKEND = "torch"
+_RUNTIME_ROUNDING_MODE = "rint"
+_RUNTIME_GROUP_SIZE = _MXFP8_BLOCK_SIZE
+_RUNTIME_ROTATION_ENABLED = False
+_RUNTIME_ROTATION = MXFP8RotationConfig()
+_RUNTIME_ROTATION_MATRIX: torch.Tensor | None = None
+_RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,7 +102,7 @@ def normalize_mxfp8_fake_quant_mode(mode: str) -> str:
     return mode
 
 
-def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
+def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     mode = normalize_mxfp8_fake_quant_mode(envs.VLLM_ASCEND_QAT_FAKE_QUANT_MODE)
     rounding_mode = normalize_mxfp8_rounding_mode(envs.VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE)
     quant_backend = str(envs.VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND).lower()
@@ -137,31 +142,70 @@ def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     )
 
 
+def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
+    """Parse rollout fake-quant settings before torch.compile captures model code."""
+    global _RUNTIME_FAKE_QUANT_ENABLED
+    global _RUNTIME_MODE
+    global _RUNTIME_QUANT_BACKEND
+    global _RUNTIME_ROUNDING_MODE
+    global _RUNTIME_GROUP_SIZE
+    global _RUNTIME_ROTATION_ENABLED
+    global _RUNTIME_ROTATION
+    global _RUNTIME_ROTATION_MATRIX
+    global _RUNTIME_IGNORE_PATTERNS
+
+    config = _read_mxfp8_fake_quant_config()
+    _RUNTIME_FAKE_QUANT_ENABLED = config.enable
+    _RUNTIME_MODE = config.mode
+    _RUNTIME_QUANT_BACKEND = config.quant_backend
+    _RUNTIME_ROUNDING_MODE = config.rounding_mode
+    _RUNTIME_GROUP_SIZE = config.group_size
+    _RUNTIME_ROTATION_ENABLED = config.rotation.enable
+    _RUNTIME_ROTATION = config.rotation
+    _RUNTIME_IGNORE_PATTERNS = config.ignore_patterns
+    _RUNTIME_ROTATION_MATRIX = (
+        _build_block_rotation_matrix(config.rotation) if config.rotation.enable else None
+    )
+    logger.warning(
+        "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
+        "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+        config.enable,
+        config.mode,
+        config.quant_backend,
+        config.rounding_mode,
+        config.group_size,
+        config.rotation.enable,
+        config.rotation.kind,
+        config.rotation.block_size,
+        config.rotation.seed,
+    )
+    return config
+
+
+def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
+    return MXFP8FakeQuantConfig(
+        enable=_RUNTIME_FAKE_QUANT_ENABLED,
+        mode=_RUNTIME_MODE,
+        quant_backend=_RUNTIME_QUANT_BACKEND,
+        rounding_mode=_RUNTIME_ROUNDING_MODE,
+        group_size=_RUNTIME_GROUP_SIZE,
+        rotation=_RUNTIME_ROTATION,
+        ignore_patterns=_RUNTIME_IGNORE_PATTERNS,
+    )
+
+
 def is_mxfp8_fake_quant_enabled() -> bool:
-    override = _FAKE_QUANT_LAYER_OVERRIDE.get()
-    if override is not None:
-        return override
-    return get_mxfp8_fake_quant_config().enable
-
-
-@contextmanager
-def fake_quant_layer_context(enabled: bool):
-    token = _FAKE_QUANT_LAYER_OVERRIDE.set(enabled)
-    try:
-        yield
-    finally:
-        _FAKE_QUANT_LAYER_OVERRIDE.reset(token)
+    return _RUNTIME_FAKE_QUANT_ENABLED
 
 
 def should_fake_quantize_layer(layer_name: str | None) -> bool:
-    config = get_mxfp8_fake_quant_config()
-    if not config.enable:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
         return False
     if not layer_name:
         return True
     return not any(
         re.match(pattern[3:], layer_name) is not None if pattern.startswith("re:") else pattern in layer_name
-        for pattern in config.ignore_patterns
+        for pattern in _RUNTIME_IGNORE_PATTERNS
     )
 
 
@@ -176,7 +220,6 @@ def _check_mxfp8_2d_tensor(tensor: torch.Tensor):
 
 
 def _round_mxfp8_scaled_abs(abs_scaled: torch.Tensor, rounding_mode: str) -> torch.Tensor:
-    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
     if rounding_mode == "rint":
         return torch.round(abs_scaled)
     if rounding_mode == "round":
@@ -244,59 +287,50 @@ def _dequantize_mxfp8(tensor_q: torch.Tensor, tensor_scale: torch.Tensor, dtype:
     return dequant.reshape_as(tensor_q).to(dtype)
 
 
-def _fake_quantize_mxfp8_tensor(tensor: torch.Tensor, config: MXFP8FakeQuantConfig) -> torch.Tensor:
+def _fake_quantize_mxfp8_tensor(tensor: torch.Tensor, rounding_mode: str) -> torch.Tensor:
     original_shape = tensor.shape
     tensor_2d = tensor.reshape(-1, tensor.shape[-1])
-    tensor_q, tensor_scale = _quantize_mxfp8_torch(tensor_2d, config.rounding_mode)
+    tensor_q, tensor_scale = _quantize_mxfp8_torch(tensor_2d, rounding_mode)
     return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
 
 
-def _maybe_rotate(tensor: torch.Tensor, config: MXFP8FakeQuantConfig) -> torch.Tensor:
-    if not config.rotation.enable:
+def _maybe_rotate(tensor: torch.Tensor) -> torch.Tensor:
+    if not _RUNTIME_ROTATION_ENABLED:
         return tensor
-    return apply_mxfp8_block_rotation(tensor, config.rotation)
+
+    last_dim = tensor.shape[-1]
+    work_dtype = torch.float32 if tensor.dtype in (torch.float16, torch.bfloat16) else tensor.dtype
+    matrix = _RUNTIME_ROTATION_MATRIX.to(device=tensor.device, dtype=work_dtype)
+    tensor_2d = tensor.reshape(-1, last_dim).to(work_dtype)
+    tensor_blocked = tensor_2d.reshape(tensor_2d.shape[0], last_dim // _RUNTIME_GROUP_SIZE, _RUNTIME_GROUP_SIZE)
+    rotated = torch.matmul(tensor_blocked, matrix)
+    return rotated.reshape(tensor_2d.shape).to(tensor.dtype).reshape_as(tensor)
 
 
 def fake_quant_mxfp8_weight(tensor: torch.Tensor) -> torch.Tensor:
-    config = get_mxfp8_fake_quant_config()
-    if not config.enable:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
-    tensor = _maybe_rotate(tensor, config)
-    _log_once(
-        ("fake_quant_weight", config.mode, config.rounding_mode, config.rotation.enable),
-        "MXFP8 fake quant enabled for rollout weights: mode=%s, rounding_mode=%s, rotation_enable=%s",
-        config.mode,
-        config.rounding_mode,
-        config.rotation.enable,
-    )
-    return _fake_quantize_mxfp8_tensor(tensor, config)
+    tensor = _maybe_rotate(tensor)
+    return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
 
 
 def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
-    config = get_mxfp8_fake_quant_config()
-    if not config.enable:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
-    tensor = _maybe_rotate(tensor, config)
-    if not config.quantize_activation:
+    tensor = _maybe_rotate(tensor)
+    if _RUNTIME_MODE != "w8a8_mxfp8":
         return tensor
-    _log_once(
-        ("fake_quant_activation", config.mode, config.rounding_mode, config.rotation.enable),
-        "MXFP8 fake quant enabled for rollout activations: mode=%s, rounding_mode=%s, rotation_enable=%s",
-        config.mode,
-        config.rounding_mode,
-        config.rotation.enable,
-    )
-    return _fake_quantize_mxfp8_tensor(tensor, config)
+    return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
 
 
 def fake_quant_mxfp8_transposed_moe_weight(weight: torch.Tensor) -> torch.Tensor:
-    if not is_mxfp8_fake_quant_enabled():
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
         return weight
     return fake_quant_mxfp8_weight(weight.transpose(-1, -2).contiguous()).transpose(-1, -2).contiguous()
 
 
 def fake_quant_mxfp8_transposed_moe_weight_list(weights: Any) -> Any:
-    if not is_mxfp8_fake_quant_enabled() or not isinstance(weights, list):
+    if not _RUNTIME_FAKE_QUANT_ENABLED or not isinstance(weights, list):
         return weights
     return [fake_quant_mxfp8_transposed_moe_weight(weight) for weight in weights]
 
@@ -307,8 +341,8 @@ __all__ = [
     "fake_quant_mxfp8_transposed_moe_weight",
     "fake_quant_mxfp8_transposed_moe_weight_list",
     "fake_quant_mxfp8_weight",
-    "fake_quant_layer_context",
     "get_mxfp8_fake_quant_config",
+    "initialize_mxfp8_fake_quant_config",
     "is_mxfp8_fake_quant_enabled",
     "normalize_mxfp8_fake_quant_mode",
     "normalize_mxfp8_rounding_mode",

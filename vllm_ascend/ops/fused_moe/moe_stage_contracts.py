@@ -69,6 +69,8 @@ class MoEFusedExpertsInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: float = 0.0
+    # Resolved once per MoE layer before torch.compile captures the forward.
+    fake_quant_enabled: bool = False
     # Optional per-layer MoE LoRA state (vllm_ascend.lora MoELoRAContext).
     # ``Any`` avoids coupling the core contracts to the LoRA module; only the
     # unquant MLP path reads it, and only when a LoRA adapter is active.
@@ -145,6 +147,8 @@ class MoEMlpComputeInput:
     need_trans: bool = False
     dynamic_eplb: bool = False
     swiglu_limit: float = 0.0
+    # Propagated from MoEFusedExpertsInput for the unquantized fake-QAT path.
+    fake_quant_enabled: bool = False
     expanded_row_idx: torch.Tensor | None = None
     topk_ids: torch.Tensor | None = None
     # Optional per-layer MoE LoRA state, propagated from MoEFusedExpertsInput.

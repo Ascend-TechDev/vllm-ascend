@@ -95,6 +95,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         fake_quant_enabled = is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(
             getattr(layer, "prefix", "")
         )
+        layer._mxfp8_fake_quant_enabled = fake_quant_enabled
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
             weight_fp32 = layer.weight.data.to(torch.float32)
@@ -112,7 +113,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(getattr(layer, "prefix", "")):
+        if getattr(layer, "_mxfp8_fake_quant_enabled", False):
             x = fake_quant_mxfp8_activation(x)
             weight = fake_quant_mxfp8_weight(layer.weight)
         else:

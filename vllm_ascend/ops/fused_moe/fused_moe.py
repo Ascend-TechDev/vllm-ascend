@@ -43,7 +43,6 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedEx
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.mxfp8_fake_quant import (
-    fake_quant_layer_context,
     is_mxfp8_fake_quant_enabled,
     should_fake_quantize_layer,
 )
@@ -132,6 +131,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         fake_quant_enabled = is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(
             getattr(layer, "prefix", "")
         )
+        layer._mxfp8_fake_quant_enabled = fake_quant_enabled
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2 and not fake_quant_enabled:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
@@ -171,9 +171,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        fake_quant_enabled = is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(
-            getattr(layer, "prefix", "")
-        )
+        fake_quant_enabled = getattr(layer, "_mxfp8_fake_quant_enabled", False)
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = getattr(get_forward_context(), "input_ids", None)
@@ -266,35 +264,35 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             w1_scale_bias = None
             w2_scale_bias = None
 
-        with fake_quant_layer_context(fake_quant_enabled):
-            final_hidden_states = moe_comm_method.fused_experts(
-                fused_experts_input=build_fused_experts_input(
-                    hidden_states=x,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    w1=w1,
-                    w2=w2,
-                    w1_bias=layer.w13_bias if self.moe.has_bias else None,
-                    w2_bias=layer.w2_bias if self.moe.has_bias else None,
-                    quant_type=QuantType.NONE,
-                    dynamic_eplb=self.dynamic_eplb,
-                    expert_map=expert_map,
-                    global_redundant_expert_num=global_redundant_expert_num,
-                    mc2_mask=mc2_mask,
-                    apply_router_weight_on_input=apply_router_weight_on_input,
-                    log2phy=log2phy,
-                    pertoken_scale=pertoken_scale,
-                    activation=activation,
-                    w1_scale=w1_scale,
-                    w2_scale=w2_scale,
-                    w1_scale_bias=w1_scale_bias,
-                    w2_scale_bias=w2_scale_bias,
-                    swiglu_limit=layer.swiglu_limit,
-                    # Per-layer MoE LoRA state, set once by AscendFusedMoEWithLoRA
-                    # when an adapter wraps this layer; None for non-LoRA layers.
-                    lora_context=getattr(layer, "_ascend_moe_lora_context", None),
-                )
+        final_hidden_states = moe_comm_method.fused_experts(
+            fused_experts_input=build_fused_experts_input(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w1=w1,
+                w2=w2,
+                w1_bias=layer.w13_bias if self.moe.has_bias else None,
+                w2_bias=layer.w2_bias if self.moe.has_bias else None,
+                quant_type=QuantType.NONE,
+                dynamic_eplb=self.dynamic_eplb,
+                expert_map=expert_map,
+                global_redundant_expert_num=global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                log2phy=log2phy,
+                pertoken_scale=pertoken_scale,
+                activation=activation,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+                swiglu_limit=layer.swiglu_limit,
+                fake_quant_enabled=fake_quant_enabled,
+                # Per-layer MoE LoRA state, set once by AscendFusedMoEWithLoRA
+                # when an adapter wraps this layer; None for non-LoRA layers.
+                lora_context=getattr(layer, "_ascend_moe_lora_context", None),
             )
+        )
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         return final_hidden_states
