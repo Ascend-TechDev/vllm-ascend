@@ -182,6 +182,57 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     return config
 
 
+def strip_checkpoint_quantization_config(model_config) -> None:
+    """Remove checkpoint quantization metadata so vLLM builds a high-precision model."""
+
+    seen: set[int] = set()
+
+    def _clear_quant_config(config_obj):
+        if config_obj is None:
+            return
+        obj_id = id(config_obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        for attr in ("quantization_config", "compression_config"):
+            if hasattr(config_obj, attr):
+                try:
+                    setattr(config_obj, attr, None)
+                except Exception:
+                    pass
+
+        for child_attr in ("text_config", "vision_config", "encoder_config", "decoder_config", "audio_config"):
+            child = getattr(config_obj, child_attr, None)
+            if child is not None:
+                _clear_quant_config(child)
+
+        sub_configs = getattr(config_obj, "sub_configs", None)
+        if isinstance(sub_configs, dict):
+            for sub_name in sub_configs:
+                _clear_quant_config(getattr(config_obj, sub_name, None))
+
+    for attr in ("quantization", "quantization_config"):
+        if hasattr(model_config, attr):
+            try:
+                setattr(model_config, attr, None)
+            except Exception:
+                pass
+
+    hf_config = getattr(model_config, "hf_config", None)
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    _clear_quant_config(hf_config)
+    if hf_text_config is not hf_config:
+        _clear_quant_config(hf_text_config)
+
+    model_arch_config = getattr(model_config, "model_arch_config", None)
+    if model_arch_config is not None and hasattr(model_arch_config, "quantization_config"):
+        try:
+            model_arch_config.quantization_config = None
+        except Exception:
+            pass
+
+
 def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     return MXFP8FakeQuantConfig(
         enable=_RUNTIME_FAKE_QUANT_ENABLED,
@@ -346,5 +397,6 @@ __all__ = [
     "is_mxfp8_fake_quant_enabled",
     "normalize_mxfp8_fake_quant_mode",
     "normalize_mxfp8_rounding_mode",
+    "strip_checkpoint_quantization_config",
     "should_fake_quantize_layer",
 ]
