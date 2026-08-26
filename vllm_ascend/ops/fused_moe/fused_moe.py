@@ -132,6 +132,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             getattr(layer, "prefix", "")
         )
         layer._mxfp8_fake_quant_enabled = fake_quant_enabled
+        if fake_quant_enabled:
+            logger.warning_once(
+                "MXFP8 rollout fake quant is active for high-precision MoE layers; "
+                "layer=%s will apply torch quantize/dequantize to expert weights and activations "
+                "before NPU grouped matmul.",
+                getattr(layer, "prefix", "<unknown>"),
+            )
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2 and not fake_quant_enabled:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)

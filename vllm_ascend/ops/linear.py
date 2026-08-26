@@ -25,6 +25,7 @@ import torch.nn as nn
 from torch.nn.parameter import Parameter
 from vllm.config import get_current_vllm_config
 from vllm.distributed import divide
+from vllm.logger import logger
 from vllm.model_executor.layers.linear import (  # noqa
     WEIGHT_LOADER_V2_SUPPORTED,
     ColumnParallelLinear,
@@ -96,6 +97,13 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
             getattr(layer, "prefix", "")
         )
         layer._mxfp8_fake_quant_enabled = fake_quant_enabled
+        if fake_quant_enabled:
+            logger.warning_once(
+                "MXFP8 rollout fake quant is active for high-precision linear layers; "
+                "layer=%s will apply torch quantize/dequantize to weights and activations "
+                "before unquantized_gemm.",
+                getattr(layer, "prefix", "<unknown>"),
+            )
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
             weight_fp32 = layer.weight.data.to(torch.float32)
