@@ -310,11 +310,6 @@ def _maybe_rotate(tensor: torch.Tensor) -> torch.Tensor:
 def fake_quant_mxfp8_weight(tensor: torch.Tensor) -> torch.Tensor:
     if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
-    _log_once(
-        ("fake_quant_weight_path",),
-        "MXFP8 rollout fake quant executed on a weight tensor; "
-        "the high-precision kernel path is receiving dequantized fake-quantized weights.",
-    )
     tensor = _maybe_rotate(tensor)
     return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
 
@@ -322,13 +317,6 @@ def fake_quant_mxfp8_weight(tensor: torch.Tensor) -> torch.Tensor:
 def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
     if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
-    _log_once(
-        ("fake_quant_activation_path", _RUNTIME_MODE),
-        "MXFP8 rollout fake quant executed on an activation tensor; "
-        "mode=%s, activation quantization=%s.",
-        _RUNTIME_MODE,
-        _RUNTIME_MODE == "w8a8_mxfp8",
-    )
     tensor = _maybe_rotate(tensor)
     if _RUNTIME_MODE != "w8a8_mxfp8":
         return tensor
