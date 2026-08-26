@@ -135,9 +135,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if fake_quant_enabled:
             logger.warning_once(
                 "MXFP8 rollout fake quant is active for high-precision MoE layers; "
-                "layer=%s will apply torch quantize/dequantize to expert weights and activations "
+                "MoE layers will apply torch quantize/dequantize to expert weights and activations "
                 "before NPU grouped matmul.",
-                getattr(layer, "prefix", "<unknown>"),
             )
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2 and not fake_quant_enabled:
