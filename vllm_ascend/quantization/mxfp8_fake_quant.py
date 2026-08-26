@@ -43,6 +43,7 @@ _MXFP8_EMAX = 8
 _MXFP8_SCALE_EMAX = 127
 _MXFP8_MIN_PRIVATE_EXP = -6
 _MXFP8_MANTISSA_SCALE = 8.0
+_MXFP8_MAX_NORM = 448.0  # torch.float8_e4m3fn max finite value
 _MXFP8_ROUNDING_MODES = {"rint", "round", "random", "hash"}
 _MXFP8_HASH_MULTIPLIER = 1664525
 _MXFP8_HASH_INCREMENT = 1013904223
@@ -248,7 +249,7 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor, rounding_mode: str) -> tuple[tor
     _check_mxfp8_2d_tensor(tensor)
     tensor_fp32 = tensor.to(torch.float32)
     original_shape = tensor_fp32.shape
-    max_norm = torch.finfo(torch.float8_e4m3fn).max
+    max_norm = _MXFP8_MAX_NORM
     num_blocks = tensor.shape[-1] // _MXFP8_BLOCK_SIZE
     blocked = tensor_fp32.reshape(tensor.shape[0], num_blocks, _MXFP8_BLOCK_SIZE)
 
@@ -271,9 +272,14 @@ def _quantize_mxfp8_torch(tensor: torch.Tensor, rounding_mode: str) -> tuple[tor
     quantized = torch.where(torch.isinf(normalized), normalized, quantized)
     quantized = torch.where(torch.isnan(normalized), normalized, quantized)
 
-    quant = quantized.reshape(original_shape).to(torch.float8_e4m3fn)
+    # This is a fake-quant/dequant path. The quantized payload is consumed
+    # immediately by _dequantize_mxfp8, so do not materialize an FP8 tensor on
+    # Ascend A2, where the float8_e4m3fn device cast is unsupported.
+    quant = quantized.reshape(original_shape)
     shared_exp_fixed = torch.nan_to_num(shared_exp, nan=-127.0)
-    scale = torch.clamp(shared_exp_fixed + 127.0, 0, 255).round().to(torch.uint8)
+    # Keep the scale in FP32 as well. The fake path immediately dequantizes it,
+    # and A2 does not need the real MXFP8 uint8/FP8 storage representation.
+    scale = torch.clamp(shared_exp_fixed + 127.0, 0, 255).round()
     return quant, scale
 
 
