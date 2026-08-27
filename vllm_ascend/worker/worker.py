@@ -369,12 +369,27 @@ class NPUWorker(WorkerBase):
         if not self._weight_update_active:
             raise RuntimeError("start_weight_update must be called before finish_weight_update.")
 
+        from vllm_ascend.quantization.mxfp8_fake_quant import (
+            apply_mxfp8_weight_fake_quant_cache,
+            invalidate_mxfp8_weight_fake_quant_cache,
+            is_mxfp8_fake_quant_enabled,
+        )
+
+        model = self.model_runner.model
+        if is_mxfp8_fake_quant_enabled():
+            invalidate_mxfp8_weight_fake_quant_cache("weight_update")
+
         if self._is_checkpoint_format:
             from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
-            model = self.model_runner.model
             with torch.device(self.device):
                 finalize_layerwise_reload(model, self.model_config)
+
+        if is_mxfp8_fake_quant_enabled():
+            with torch.device(self.device):
+                refreshed_layers = apply_mxfp8_weight_fake_quant_cache(model)
+            if refreshed_layers:
+                torch.npu.synchronize()
 
         self._weight_update_active = False
         self._is_checkpoint_format = True

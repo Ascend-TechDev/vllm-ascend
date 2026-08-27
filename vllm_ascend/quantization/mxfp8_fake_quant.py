@@ -62,6 +62,7 @@ _RUNTIME_ROTATION_ENABLED = False
 _RUNTIME_ROTATION = MXFP8RotationConfig()
 _RUNTIME_ROTATION_MATRIX: torch.Tensor | None = None
 _RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
+_WEIGHT_FAKE_QUANT_CACHE_EPOCH = 0
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,17 @@ def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
 
 def is_mxfp8_fake_quant_enabled() -> bool:
     return _RUNTIME_FAKE_QUANT_ENABLED
+
+
+def invalidate_mxfp8_weight_fake_quant_cache(reason: str | None = None):
+    """Invalidate cached in-place fake-quantized weights after a weight update."""
+    global _WEIGHT_FAKE_QUANT_CACHE_EPOCH
+    _WEIGHT_FAKE_QUANT_CACHE_EPOCH += 1
+    logger.info(
+        "MXFP8 rollout fake quant weight cache invalidated: epoch=%s%s",
+        _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
+        f", reason={reason}" if reason else "",
+    )
 
 
 def should_fake_quantize_layer(layer_name: str | None) -> bool:
@@ -341,14 +353,141 @@ def fake_quant_mxfp8_transposed_moe_weight_list(weights: Any) -> Any:
     return [fake_quant_mxfp8_transposed_moe_weight(weight) for weight in weights]
 
 
+def _tensor_cache_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+    return (
+        int(tensor.data_ptr()),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+        getattr(tensor, "_version", None),
+    )
+
+
+def _cache_signature(tensors: tuple[torch.Tensor, ...]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(_tensor_cache_signature(tensor) for tensor in tensors)
+
+
+def _is_weight_cache_valid(layer: Any, cache_attr: str, tensors: tuple[torch.Tensor, ...]) -> bool:
+    cache_state = getattr(layer, cache_attr, None)
+    if cache_state is None:
+        return False
+    cache_epoch, cache_signature = cache_state
+    return cache_epoch == _WEIGHT_FAKE_QUANT_CACHE_EPOCH and cache_signature == _cache_signature(tensors)
+
+
+def _mark_weight_cache_valid(layer: Any, cache_attr: str, tensors: tuple[torch.Tensor, ...]):
+    setattr(layer, cache_attr, (_WEIGHT_FAKE_QUANT_CACHE_EPOCH, _cache_signature(tensors)))
+
+
+def fake_quant_mxfp8_weight_inplace(tensor: torch.Tensor) -> torch.Tensor:
+    """Fake-quant/dequant a weight once and overwrite it with the dequantized value."""
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return tensor
+    with torch.no_grad():
+        tensor.copy_(fake_quant_mxfp8_weight(tensor))
+    return tensor
+
+
+def fake_quant_mxfp8_transposed_moe_weight_inplace(weight: torch.Tensor) -> torch.Tensor:
+    """In-place MoE weight fake quant with verl's canonical [E, N, K] layout."""
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return weight
+    with torch.no_grad():
+        weight.copy_(fake_quant_mxfp8_transposed_moe_weight(weight))
+    return weight
+
+
+def ensure_mxfp8_linear_weight_fake_quantized(layer: Any) -> bool:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return False
+    weight = getattr(layer, "weight", None)
+    if weight is None:
+        return False
+
+    tensors = (weight,)
+    cache_attr = "_mxfp8_fake_quant_weight_cache"
+    if _is_weight_cache_valid(layer, cache_attr, tensors):
+        return False
+
+    fake_quant_mxfp8_weight_inplace(weight)
+    _mark_weight_cache_valid(layer, cache_attr, tensors)
+    return True
+
+
+def _iter_tensor_list(value: Any) -> tuple[torch.Tensor, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(tensor for tensor in value if isinstance(tensor, torch.Tensor))
+
+
+def ensure_mxfp8_moe_weight_fake_quantized(layer: Any) -> bool:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return False
+
+    w13_weight = getattr(layer, "w13_weight", None)
+    w2_weight = getattr(layer, "w2_weight", None)
+    w13_weight_list = _iter_tensor_list(getattr(layer, "w13_weight_list", None))
+    w2_weight_list = _iter_tensor_list(getattr(layer, "w2_weight_list", None))
+    tensors = tuple(
+        tensor
+        for tensor in (
+            w13_weight,
+            w2_weight,
+            *w13_weight_list,
+            *w2_weight_list,
+        )
+        if isinstance(tensor, torch.Tensor)
+    )
+    if not tensors:
+        return False
+
+    cache_attr = "_mxfp8_fake_quant_moe_weight_cache"
+    if _is_weight_cache_valid(layer, cache_attr, tensors):
+        return False
+
+    for tensor in tensors:
+        fake_quant_mxfp8_transposed_moe_weight_inplace(tensor)
+    _mark_weight_cache_valid(layer, cache_attr, tensors)
+    return True
+
+
+def apply_mxfp8_weight_fake_quant_cache(model: torch.nn.Module) -> int:
+    """Refresh all layer-local fake-quantized weight caches in a model."""
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return 0
+
+    cached_layers = 0
+    for module in model.modules():
+        if not getattr(module, "_mxfp8_fake_quant_enabled", False):
+            continue
+        if any(hasattr(module, attr) for attr in ("w13_weight", "w2_weight", "w13_weight_list", "w2_weight_list")):
+            cached_layers += int(ensure_mxfp8_moe_weight_fake_quantized(module))
+        elif hasattr(module, "weight"):
+            cached_layers += int(ensure_mxfp8_linear_weight_fake_quantized(module))
+
+    if cached_layers:
+        logger.warning(
+            "MXFP8 rollout fake quant weight cache refreshed: layers=%s, epoch=%s",
+            cached_layers,
+            _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
+        )
+    return cached_layers
+
+
 __all__ = [
     "MXFP8FakeQuantConfig",
+    "apply_mxfp8_weight_fake_quant_cache",
+    "ensure_mxfp8_linear_weight_fake_quantized",
+    "ensure_mxfp8_moe_weight_fake_quantized",
     "fake_quant_mxfp8_activation",
     "fake_quant_mxfp8_transposed_moe_weight",
     "fake_quant_mxfp8_transposed_moe_weight_list",
     "fake_quant_mxfp8_weight",
+    "fake_quant_mxfp8_weight_inplace",
     "get_mxfp8_fake_quant_config",
     "initialize_mxfp8_fake_quant_config",
+    "invalidate_mxfp8_weight_fake_quant_cache",
     "is_mxfp8_fake_quant_enabled",
     "normalize_mxfp8_fake_quant_mode",
     "normalize_mxfp8_rounding_mode",

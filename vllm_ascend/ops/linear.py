@@ -43,8 +43,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.quantization.mxfp8_fake_quant import (
+    ensure_mxfp8_linear_weight_fake_quantized,
     fake_quant_mxfp8_activation,
-    fake_quant_mxfp8_weight,
     is_mxfp8_fake_quant_enabled,
     should_fake_quantize_layer,
 )
@@ -100,9 +100,10 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         if fake_quant_enabled:
             logger.warning_once(
                 "MXFP8 rollout fake quant is active for high-precision linear layers; "
-                "linear layers will apply torch quantize/dequantize to weights and activations "
-                "before unquantized_gemm.",
+                "linear layers will cache in-place torch quantize/dequantize weights and apply "
+                "torch quantize/dequantize to activations before unquantized_gemm.",
             )
+            ensure_mxfp8_linear_weight_fake_quantized(layer)
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
             weight_fp32 = layer.weight.data.to(torch.float32)
@@ -121,11 +122,9 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_mxfp8_fake_quant_enabled", False):
+            ensure_mxfp8_linear_weight_fake_quantized(layer)
             x = fake_quant_mxfp8_activation(x)
-            weight = fake_quant_mxfp8_weight(layer.weight)
-        else:
-            weight = layer.weight
-        return torch.ops.vllm.unquantized_gemm(x, weight, bias)
+        return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group

@@ -43,6 +43,7 @@ from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedEx
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.mxfp8_fake_quant import (
+    ensure_mxfp8_moe_weight_fake_quantized,
     is_mxfp8_fake_quant_enabled,
     should_fake_quantize_layer,
 )
@@ -135,9 +136,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if fake_quant_enabled:
             logger.warning_once(
                 "MXFP8 rollout fake quant is active for high-precision MoE layers; "
-                "MoE layers will apply torch quantize/dequantize to expert weights and activations "
-                "before NPU grouped matmul.",
+                "MoE layers will cache in-place torch quantize/dequantize expert weights and apply "
+                "torch quantize/dequantize to activations before NPU grouped matmul.",
             )
+            ensure_mxfp8_moe_weight_fake_quantized(layer)
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if enable_fused_mc2 and not fake_quant_enabled:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
@@ -178,6 +180,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         mc2_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fake_quant_enabled = getattr(layer, "_mxfp8_fake_quant_enabled", False)
+        if fake_quant_enabled:
+            ensure_mxfp8_moe_weight_fake_quantized(layer)
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = getattr(get_forward_context(), "input_ids", None)
