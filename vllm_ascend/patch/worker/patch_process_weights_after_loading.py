@@ -24,6 +24,16 @@ def _is_dsa_attention(module: nn.Module) -> bool:
 def ascend_process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    from vllm_ascend.quantization.mxfp8_fake_quant import (
+        invalidate_mxfp8_weight_fake_quant_cache,
+        is_mxfp8_fake_quant_enabled,
+        log_mxfp8_weight_fake_quant_cache_refresh,
+    )
+
+    mxfp8_fake_quant_enabled = is_mxfp8_fake_quant_enabled()
+    if mxfp8_fake_quant_enabled:
+        invalidate_mxfp8_weight_fake_quant_cache("process_weights_after_loading")
+
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
@@ -50,6 +60,9 @@ def ascend_process_weights_after_loading(
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
+
+    if mxfp8_fake_quant_enabled:
+        log_mxfp8_weight_fake_quant_cache_refresh("process_weights_after_loading")
 
 
 utils.process_weights_after_loading = ascend_process_weights_after_loading

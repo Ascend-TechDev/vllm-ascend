@@ -373,6 +373,7 @@ class NPUWorker(WorkerBase):
             apply_mxfp8_weight_fake_quant_cache,
             invalidate_mxfp8_weight_fake_quant_cache,
             is_mxfp8_fake_quant_enabled,
+            log_mxfp8_weight_fake_quant_cache_refresh,
         )
 
         model = self.model_runner.model
@@ -390,6 +391,7 @@ class NPUWorker(WorkerBase):
                 refreshed_layers = apply_mxfp8_weight_fake_quant_cache(model)
             if refreshed_layers:
                 torch.npu.synchronize()
+            log_mxfp8_weight_fake_quant_cache_refresh("weight_update")
 
         self._weight_update_active = False
         self._is_checkpoint_format = True

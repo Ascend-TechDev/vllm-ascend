@@ -63,6 +63,7 @@ _RUNTIME_ROTATION = MXFP8RotationConfig()
 _RUNTIME_ROTATION_MATRIX: torch.Tensor | None = None
 _RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
 _WEIGHT_FAKE_QUANT_CACHE_EPOCH = 0
+_WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
 
 
 @dataclass(frozen=True)
@@ -203,9 +204,25 @@ def is_mxfp8_fake_quant_enabled() -> bool:
 def invalidate_mxfp8_weight_fake_quant_cache(reason: str | None = None):
     """Invalidate cached in-place fake-quantized weights after a weight update."""
     global _WEIGHT_FAKE_QUANT_CACHE_EPOCH
+    global _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS
     _WEIGHT_FAKE_QUANT_CACHE_EPOCH += 1
+    _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
     logger.info(
         "MXFP8 rollout fake quant weight cache invalidated: epoch=%s%s",
+        _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
+        f", reason={reason}" if reason else "",
+    )
+
+
+def _record_weight_fake_quant_refresh():
+    global _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS
+    _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS += 1
+
+
+def log_mxfp8_weight_fake_quant_cache_refresh(reason: str | None = None):
+    logger.warning(
+        "MXFP8 rollout fake quant weight cache refreshed: layers=%s, epoch=%s%s",
+        _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS,
         _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
         f", reason={reason}" if reason else "",
     )
@@ -412,6 +429,7 @@ def ensure_mxfp8_linear_weight_fake_quantized(layer: Any) -> bool:
 
     fake_quant_mxfp8_weight_inplace(weight)
     _mark_weight_cache_valid(layer, cache_attr, tensors)
+    _record_weight_fake_quant_refresh()
     return True
 
 
@@ -449,6 +467,7 @@ def ensure_mxfp8_moe_weight_fake_quantized(layer: Any) -> bool:
     for tensor in tensors:
         fake_quant_mxfp8_transposed_moe_weight_inplace(tensor)
     _mark_weight_cache_valid(layer, cache_attr, tensors)
+    _record_weight_fake_quant_refresh()
     return True
 
 
@@ -466,12 +485,6 @@ def apply_mxfp8_weight_fake_quant_cache(model: torch.nn.Module) -> int:
         elif hasattr(module, "weight"):
             cached_layers += int(ensure_mxfp8_linear_weight_fake_quantized(module))
 
-    if cached_layers:
-        logger.warning(
-            "MXFP8 rollout fake quant weight cache refreshed: layers=%s, epoch=%s",
-            cached_layers,
-            _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
-        )
     return cached_layers
 
 
@@ -489,6 +502,7 @@ __all__ = [
     "initialize_mxfp8_fake_quant_config",
     "invalidate_mxfp8_weight_fake_quant_cache",
     "is_mxfp8_fake_quant_enabled",
+    "log_mxfp8_weight_fake_quant_cache_refresh",
     "normalize_mxfp8_fake_quant_mode",
     "normalize_mxfp8_rounding_mode",
     "should_fake_quantize_layer",
