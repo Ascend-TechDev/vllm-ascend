@@ -180,8 +180,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         mc2_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         fake_quant_enabled = getattr(layer, "_mxfp8_fake_quant_enabled", False)
-        if fake_quant_enabled:
-            ensure_mxfp8_moe_weight_fake_quantized(layer)
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = getattr(get_forward_context(), "input_ids", None)

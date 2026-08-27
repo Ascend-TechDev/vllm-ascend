@@ -122,7 +122,6 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_mxfp8_fake_quant_enabled", False):
-            ensure_mxfp8_linear_weight_fake_quantized(layer)
             x = fake_quant_mxfp8_activation(x)
         return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
