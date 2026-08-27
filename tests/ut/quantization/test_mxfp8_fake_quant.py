@@ -40,6 +40,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": "7",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": '["Fprop"]',
             "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": "[]",
         }
         with patch.dict(os.environ, env, clear=False):
@@ -56,3 +57,24 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             rotated = fake_quant._maybe_rotate(tensor)
             expected = torch.matmul(tensor.view(2, 1, 32), matrix).view(2, 32)
             self.assertTrue(torch.allclose(rotated, expected))
+
+    def test_backward_only_targets_do_not_rotate_rollout_activation(self):
+        env = {
+            "VLLM_ASCEND_QAT_FAKE_QUANT": "1",
+            "VLLM_ASCEND_QAT_FAKE_QUANT_MODE": "w8a8_mxfp8",
+            "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
+            "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
+            "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "true",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": "7",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": '["Dgrad", "Wgrad"]',
+            "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": "[]",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            fake_quant.initialize_mxfp8_fake_quant_config()
+            tensor = torch.randn(2, 32)
+
+            self.assertIs(fake_quant._maybe_rotate(tensor), tensor)
+            self.assertIsNone(fake_quant.warmup_mxfp8_rotation_matrix("cpu"))

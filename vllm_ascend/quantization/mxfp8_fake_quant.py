@@ -33,8 +33,11 @@ from vllm.logger import logger
 
 from vllm_ascend import envs
 from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
     MXFP8RotationConfig,
     _build_block_rotation_matrix,
+    is_mxfp8_rotation_target,
+    normalize_mxfp8_rotation_targets,
     validate_mxfp8_rotation_config,
 )
 
@@ -122,6 +125,7 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         kind=str(envs.VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND),
         block_size=int(envs.VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE),
         seed=int(envs.VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED),
+        targets=normalize_mxfp8_rotation_targets(envs.VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS),
     )
     validate_mxfp8_rotation_config(rotation, group_size=group_size)
     if group_size != _MXFP8_BLOCK_SIZE:
@@ -168,23 +172,25 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     _RUNTIME_QUANT_BACKEND = config.quant_backend
     _RUNTIME_ROUNDING_MODE = config.rounding_mode
     _RUNTIME_GROUP_SIZE = config.group_size
-    _RUNTIME_ROTATION_ENABLED = config.rotation.enable
+    _RUNTIME_ROTATION_ENABLED = is_mxfp8_rotation_target(config.rotation, MXFP8_ROTATION_TARGET_FPROP)
     _RUNTIME_ROTATION = config.rotation
     _RUNTIME_IGNORE_PATTERNS = config.ignore_patterns
     _RUNTIME_ROTATION_MATRIX = (
-        _build_block_rotation_matrix(config.rotation) if config.rotation.enable else None
+        _build_block_rotation_matrix(config.rotation) if _RUNTIME_ROTATION_ENABLED else None
     )
     with _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK:
         _RUNTIME_ROTATION_DEVICE_MATRICES = {}
     logger.warning(
         "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
-        "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
+        "group_size=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
+        "rotation_block_size=%s, rotation_seed=%s",
         config.enable,
         config.mode,
         config.quant_backend,
         config.rounding_mode,
         config.group_size,
         config.rotation.enable,
+        config.rotation.targets,
         config.rotation.kind,
         config.rotation.block_size,
         config.rotation.seed,
@@ -377,7 +383,9 @@ def warmup_mxfp8_rotation_matrix(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor | None:
     """Materialize the rollout rotation matrix on a worker device."""
-    if not _RUNTIME_ROTATION_ENABLED:
+    if not _RUNTIME_ROTATION_ENABLED or not is_mxfp8_rotation_target(
+        _RUNTIME_ROTATION, MXFP8_ROTATION_TARGET_FPROP
+    ):
         return None
     if _RUNTIME_ROTATION_MATRIX is None:
         raise RuntimeError("MXFP8 rotation matrix is not initialized")
@@ -401,7 +409,7 @@ def warmup_mxfp8_rotation_matrix(
 
 
 def _maybe_rotate(tensor: torch.Tensor) -> torch.Tensor:
-    if not _RUNTIME_ROTATION_ENABLED:
+    if not is_mxfp8_rotation_target(_RUNTIME_ROTATION, MXFP8_ROTATION_TARGET_FPROP):
         return tensor
 
     last_dim = tensor.shape[-1]

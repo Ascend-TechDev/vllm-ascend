@@ -33,9 +33,11 @@ from vllm_ascend.quantization.mxfp8_fake_quant import (
     fake_quant_mxfp8_activation,
 )
 from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
     get_mxfp8_rotation_config,
+    is_mxfp8_rotation_target,
     validate_mxfp8_rotation_config,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -149,7 +151,7 @@ def _apply_rotated_mxfp8_swiglu_quant(
         hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
     else:
         hidden_states = torch_npu.npu_swiglu(hidden_states)
-    if rotation_config.enable:
+    if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP):
         hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
     hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
         hidden_states=hidden_states,
@@ -200,16 +202,17 @@ def quant_apply_mlp(
             raise NotImplementedError("MXFP path does not support antiquant offset yet.")
         if act_quant_type == torch.float8_e4m3fn:
             rotation_config = _get_mxfp8_rotation_config()
-            if rotation_config.enable:
+            if is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP):
                 validate_mxfp8_rotation_config(rotation_config)
                 rotate_mxfp8_swiglu = True
                 use_gmm_swiglu_quant_fusion = False
                 logger.info_once(
                     "MXFP8 block rotation enabled for MoE SwigLU output; "
-                    "using split GMM1/SwiGLU/rotation/quant path: kind=%s, block_size=%s, seed=%s",
+                    "using split GMM1/SwiGLU/rotation/quant path: kind=%s, block_size=%s, seed=%s, targets=%s",
                     rotation_config.kind,
                     rotation_config.block_size,
                     rotation_config.seed,
+                    rotation_config.targets,
                 )
 
     if w1_offset is not None:

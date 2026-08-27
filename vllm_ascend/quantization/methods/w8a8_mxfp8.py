@@ -36,8 +36,10 @@ from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
     apply_mxfp8_block_rotation,
     get_mxfp8_rotation_config,
+    is_mxfp8_rotation_target,
     validate_mxfp8_rotation_config,
 )
 
@@ -63,12 +65,13 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         self.group_size = quant_description.get("group_size", 32)
         self.rotation_config = get_mxfp8_rotation_config(quant_description)
         validate_mxfp8_rotation_config(self.rotation_config, group_size=self.group_size)
-        if self.rotation_config.enable:
+        if is_mxfp8_rotation_target(self.rotation_config, MXFP8_ROTATION_TARGET_FPROP):
             logger.info_once(
-                "MXFP8 block rotation enabled for dynamic linear: kind=%s, block_size=%s, seed=%s",
+                "MXFP8 block rotation enabled for dynamic linear: kind=%s, block_size=%s, seed=%s, targets=%s",
                 self.rotation_config.kind,
                 self.rotation_config.block_size,
                 self.rotation_config.seed,
+                self.rotation_config.targets,
             )
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
@@ -90,8 +93,11 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
         if isinstance(x, tuple):
-            if self.rotation_config.enable:
-                raise ValueError("MXFP8 block rotation must run before activation quantization in AscendW8A8MXFP8DynamicLinearMethod")
+            if is_mxfp8_rotation_target(self.rotation_config, MXFP8_ROTATION_TARGET_FPROP):
+                raise ValueError(
+                    "MXFP8 block rotation must run before activation quantization in "
+                    "AscendW8A8MXFP8DynamicLinearMethod"
+                )
             quantized_x, pertoken_scale = x
             original_shape = quantized_x.shape
             output_dtype = torch.bfloat16
@@ -100,7 +106,7 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             original_shape = x.shape
             if x.dim() > 2:
                 x = x.view(-1, x.shape[-1])
-            if self.rotation_config.enable:
+            if is_mxfp8_rotation_target(self.rotation_config, MXFP8_ROTATION_TARGET_FPROP):
                 x = apply_mxfp8_block_rotation(x, self.rotation_config)
             quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
             output_dtype = x.dtype
