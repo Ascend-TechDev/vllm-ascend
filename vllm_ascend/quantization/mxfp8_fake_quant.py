@@ -61,9 +61,13 @@ _RUNTIME_GROUP_SIZE = _MXFP8_BLOCK_SIZE
 _RUNTIME_ROTATION_ENABLED = False
 _RUNTIME_ROTATION = MXFP8RotationConfig()
 _RUNTIME_ROTATION_MATRIX: torch.Tensor | None = None
+_RUNTIME_ROTATION_DEVICE_MATRICES: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+_RUNTIME_ROTATION_DEVICE_MATRICES_LOCK = threading.Lock()
 _RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
 _WEIGHT_FAKE_QUANT_CACHE_EPOCH = 0
 _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
+_WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS = 0
+_WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS = 0
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     global _RUNTIME_ROTATION_ENABLED
     global _RUNTIME_ROTATION
     global _RUNTIME_ROTATION_MATRIX
+    global _RUNTIME_ROTATION_DEVICE_MATRICES
     global _RUNTIME_IGNORE_PATTERNS
 
     config = _read_mxfp8_fake_quant_config()
@@ -169,6 +174,8 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     _RUNTIME_ROTATION_MATRIX = (
         _build_block_rotation_matrix(config.rotation) if config.rotation.enable else None
     )
+    with _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK:
+        _RUNTIME_ROTATION_DEVICE_MATRICES = {}
     logger.warning(
         "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
         "group_size=%s, rotation_enable=%s, rotation_kind=%s, rotation_block_size=%s, rotation_seed=%s",
@@ -205,8 +212,12 @@ def invalidate_mxfp8_weight_fake_quant_cache(reason: str | None = None):
     """Invalidate cached in-place fake-quantized weights after a weight update."""
     global _WEIGHT_FAKE_QUANT_CACHE_EPOCH
     global _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS
+    global _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS
+    global _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS
     _WEIGHT_FAKE_QUANT_CACHE_EPOCH += 1
     _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
+    _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS = 0
+    _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS = 0
     logger.info(
         "MXFP8 rollout fake quant weight cache invalidated: epoch=%s%s",
         _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
@@ -214,15 +225,26 @@ def invalidate_mxfp8_weight_fake_quant_cache(reason: str | None = None):
     )
 
 
-def _record_weight_fake_quant_refresh():
+def _record_weight_fake_quant_refresh(layer_kind: str):
     global _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS
+    global _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS
+    global _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS
     _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS += 1
+    if layer_kind == "linear":
+        _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS += 1
+    elif layer_kind == "moe":
+        _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS += 1
+    else:
+        raise ValueError(f"Unsupported MXFP8 fake quant layer kind: {layer_kind}")
 
 
 def log_mxfp8_weight_fake_quant_cache_refresh(reason: str | None = None):
     logger.warning(
-        "MXFP8 rollout fake quant weight cache refreshed: layers=%s, epoch=%s%s",
+        "MXFP8 rollout fake quant weight cache refreshed: layers=%s, linear_layers=%s, moe_layers=%s, "
+        "epoch=%s%s",
         _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS,
+        _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS,
+        _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS,
         _WEIGHT_FAKE_QUANT_CACHE_EPOCH,
         f", reason={reason}" if reason else "",
     )
@@ -329,13 +351,62 @@ def _fake_quantize_mxfp8_tensor(tensor: torch.Tensor, rounding_mode: str) -> tor
     return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
 
 
+def _get_runtime_rotation_matrix(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if _RUNTIME_ROTATION_MATRIX is None:
+        raise RuntimeError("MXFP8 rotation matrix is not initialized")
+
+    device = torch.device(device)
+    cache_key = (str(device), dtype)
+    matrix = _RUNTIME_ROTATION_DEVICE_MATRICES.get(cache_key)
+    if matrix is None and device.type == "cpu":
+        with _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK:
+            matrix = _RUNTIME_ROTATION_DEVICE_MATRICES.get(cache_key)
+            if matrix is None:
+                matrix = _RUNTIME_ROTATION_MATRIX.to(device=device, dtype=dtype)
+                _RUNTIME_ROTATION_DEVICE_MATRICES[cache_key] = matrix
+    if matrix is None:
+        raise RuntimeError(
+            "MXFP8 rollout rotation matrix is not warmed up for "
+            f"device={device}, dtype={dtype}; warm it up before model compilation or graph capture"
+        )
+    return matrix
+
+
+def warmup_mxfp8_rotation_matrix(
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor | None:
+    """Materialize the rollout rotation matrix on a worker device."""
+    if not _RUNTIME_ROTATION_ENABLED:
+        return None
+    if _RUNTIME_ROTATION_MATRIX is None:
+        raise RuntimeError("MXFP8 rotation matrix is not initialized")
+
+    device = torch.device(device)
+    cache_key = (str(device), dtype)
+    with _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK:
+        matrix = _RUNTIME_ROTATION_DEVICE_MATRICES.get(cache_key)
+        if matrix is None:
+            # Materialize the matrix before graph capture. The captured
+            # forward must only read an already-device-resident tensor.
+            matrix = _RUNTIME_ROTATION_MATRIX.to(device=device, dtype=dtype)
+            _RUNTIME_ROTATION_DEVICE_MATRICES[cache_key] = matrix
+            _log_once(
+                ("rotation_matrix_warmup", str(device), dtype),
+                "MXFP8 rollout rotation matrix warmed up: device=%s, dtype=%s",
+                device,
+                dtype,
+            )
+    return matrix
+
+
 def _maybe_rotate(tensor: torch.Tensor) -> torch.Tensor:
     if not _RUNTIME_ROTATION_ENABLED:
         return tensor
 
     last_dim = tensor.shape[-1]
     work_dtype = torch.float32 if tensor.dtype in (torch.float16, torch.bfloat16) else tensor.dtype
-    matrix = _RUNTIME_ROTATION_MATRIX.to(device=tensor.device, dtype=work_dtype)
+    matrix = _get_runtime_rotation_matrix(tensor.device, work_dtype)
     tensor_2d = tensor.reshape(-1, last_dim).to(work_dtype)
     tensor_blocked = tensor_2d.reshape(tensor_2d.shape[0], last_dim // _RUNTIME_GROUP_SIZE, _RUNTIME_GROUP_SIZE)
     rotated = torch.matmul(tensor_blocked, matrix)
@@ -429,7 +500,7 @@ def ensure_mxfp8_linear_weight_fake_quantized(layer: Any) -> bool:
 
     fake_quant_mxfp8_weight_inplace(weight)
     _mark_weight_cache_valid(layer, cache_attr, tensors)
-    _record_weight_fake_quant_refresh()
+    _record_weight_fake_quant_refresh("linear")
     return True
 
 
@@ -467,7 +538,7 @@ def ensure_mxfp8_moe_weight_fake_quantized(layer: Any) -> bool:
     for tensor in tensors:
         fake_quant_mxfp8_transposed_moe_weight_inplace(tensor)
     _mark_weight_cache_valid(layer, cache_attr, tensors)
-    _record_weight_fake_quant_refresh()
+    _record_weight_fake_quant_refresh("moe")
     return True
 
 
@@ -506,4 +577,5 @@ __all__ = [
     "normalize_mxfp8_fake_quant_mode",
     "normalize_mxfp8_rounding_mode",
     "should_fake_quantize_layer",
+    "warmup_mxfp8_rotation_matrix",
 ]

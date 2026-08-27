@@ -113,7 +113,7 @@ class NPUWorker(WorkerBase):
         # model. The compiled forward must only read plain constants/tensors.
         from vllm_ascend.quantization.mxfp8_fake_quant import initialize_mxfp8_fake_quant_config
 
-        fake_quant_config = initialize_mxfp8_fake_quant_config()
+        self._mxfp8_fake_quant_config = initialize_mxfp8_fake_quant_config()
 
         # Register ops when worker init.
         from vllm_ascend import ops
@@ -699,6 +699,12 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
 
         with context, set_current_vllm_config(self.vllm_config):
+            fake_quant_config = getattr(self, "_mxfp8_fake_quant_config", None)
+            if fake_quant_config is not None and fake_quant_config.enable and fake_quant_config.rotation.enable:
+                from vllm_ascend.quantization.mxfp8_fake_quant import warmup_mxfp8_rotation_matrix
+
+                warmup_mxfp8_rotation_matrix(self.device)
+                torch.npu.synchronize()
             self.model_runner.load_model()
 
         if self.vllm_config.weight_transfer_config is not None:
