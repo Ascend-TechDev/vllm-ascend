@@ -434,7 +434,7 @@ def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
     tensor = _maybe_rotate(tensor)
     if _RUNTIME_MODE != "w8a8_mxfp8":
         return tensor
-    return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
+    return _fake_quantize_mxfp8_tensor(tensor, "rint")
 
 
 def fake_quant_mxfp8_transposed_moe_weight(weight: torch.Tensor) -> torch.Tensor:
