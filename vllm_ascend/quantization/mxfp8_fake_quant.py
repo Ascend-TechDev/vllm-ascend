@@ -53,6 +53,7 @@ _MXFP8_HASH_INCREMENT = 1013904223
 _MXFP8_HASH_MODULUS = 2**32
 _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
+_MXFP8_FALLBACK_RANGE_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?$")
 _LOGGED_KEYS: set[tuple[Any, ...]] = set()
 _LOG_LOCK = threading.Lock()
 
@@ -67,6 +68,7 @@ _RUNTIME_ROTATION_MATRIX: torch.Tensor | None = None
 _RUNTIME_ROTATION_DEVICE_MATRICES: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK = threading.Lock()
 _RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
+_RUNTIME_FALLBACK_LAYERS: tuple[tuple[int, int], ...] = ()
 _WEIGHT_FAKE_QUANT_CACHE_EPOCH = 0
 _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
 _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS = 0
@@ -82,6 +84,7 @@ class MXFP8FakeQuantConfig:
     group_size: int
     rotation: MXFP8RotationConfig
     ignore_patterns: tuple[str, ...]
+    fallback_layers: tuple[tuple[int, int], ...]
 
     @property
     def quantize_activation(self) -> bool:
@@ -110,6 +113,64 @@ def normalize_mxfp8_fake_quant_mode(mode: str) -> str:
     if mode not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
         raise ValueError(f"Unsupported MXFP8 fake quant mode: {mode}")
     return mode
+
+
+def normalize_mxfp8_fallback_layers(value: Any) -> tuple[tuple[int, int], ...]:
+    """Normalize inclusive fallback layer ranges from the environment."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if raw_value.startswith("["):
+            try:
+                value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                value = raw_value.strip("[]()")
+        else:
+            value = raw_value
+        if isinstance(value, str):
+            value = value.strip("[]()")
+        if not value:
+            return ()
+    if isinstance(value, str):
+        value = re.sub(r"\s*[-:]\s*", "-", value)
+        items = re.split(r"[,;\s]+", value)
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = [value]
+
+    ranges = []
+    for item in items:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            if len(item) != 2:
+                raise ValueError(f"Each MXFP8 fallback layer range must contain two values, got: {item!r}")
+            start, end = int(item[0]), int(item[1])
+        else:
+            token = str(item).strip().strip("[]()").replace(":", "-")
+            if not token:
+                continue
+            match = _MXFP8_FALLBACK_RANGE_RE.fullmatch(token)
+            if match is None:
+                raise ValueError(
+                    f"Invalid MXFP8 fallback layer range: {item!r}. "
+                    "Expected a layer index or an inclusive range such as '37-48'."
+                )
+            start = int(match.group(1))
+            end = int(match.group(2) or start)
+        if start < 0 or end < 0 or start > end:
+            raise ValueError(f"Invalid MXFP8 fallback layer range: {item!r}")
+        ranges.append((start, end))
+
+    normalized = []
+    for start, end in sorted(ranges):
+        if normalized and start <= normalized[-1][1] + 1:
+            normalized[-1] = (normalized[-1][0], max(normalized[-1][1], end))
+        else:
+            normalized.append((start, end))
+    return tuple(normalized)
 
 
 def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
@@ -142,6 +203,7 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         raise ValueError("VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS must be a JSON list") from exc
     if not all(isinstance(pattern, str) for pattern in ignore_patterns):
         raise ValueError("VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS must contain only strings")
+    fallback_layers = normalize_mxfp8_fallback_layers(envs.VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS)
     return MXFP8FakeQuantConfig(
         enable=bool(envs.VLLM_ASCEND_QAT_FAKE_QUANT),
         mode=mode,
@@ -150,6 +212,7 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         group_size=group_size,
         rotation=rotation,
         ignore_patterns=ignore_patterns,
+        fallback_layers=fallback_layers,
     )
 
 
@@ -165,6 +228,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     global _RUNTIME_ROTATION_MATRIX
     global _RUNTIME_ROTATION_DEVICE_MATRICES
     global _RUNTIME_IGNORE_PATTERNS
+    global _RUNTIME_FALLBACK_LAYERS
 
     config = _read_mxfp8_fake_quant_config()
     _RUNTIME_FAKE_QUANT_ENABLED = config.enable
@@ -175,6 +239,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     _RUNTIME_ROTATION_ENABLED = is_mxfp8_rotation_target(config.rotation, MXFP8_ROTATION_TARGET_FPROP)
     _RUNTIME_ROTATION = config.rotation
     _RUNTIME_IGNORE_PATTERNS = config.ignore_patterns
+    _RUNTIME_FALLBACK_LAYERS = config.fallback_layers
     _RUNTIME_ROTATION_MATRIX = (
         _build_block_rotation_matrix(config.rotation) if _RUNTIME_ROTATION_ENABLED else None
     )
@@ -183,7 +248,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     logger.warning(
         "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
         "group_size=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
-        "rotation_block_size=%s, rotation_seed=%s",
+        "rotation_block_size=%s, rotation_seed=%s, fallback_layers=%s",
         config.enable,
         config.mode,
         config.quant_backend,
@@ -194,6 +259,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         config.rotation.kind,
         config.rotation.block_size,
         config.rotation.seed,
+        config.fallback_layers,
     )
     return config
 
@@ -207,6 +273,7 @@ def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         group_size=_RUNTIME_GROUP_SIZE,
         rotation=_RUNTIME_ROTATION,
         ignore_patterns=_RUNTIME_IGNORE_PATTERNS,
+        fallback_layers=_RUNTIME_FALLBACK_LAYERS,
     )
 
 
@@ -256,11 +323,23 @@ def log_mxfp8_weight_fake_quant_cache_refresh(reason: str | None = None):
     )
 
 
+def _get_mxfp8_layer_index(layer_name: str) -> int | None:
+    match = re.search(r"(?:^|\.)(?:layers\.(\d+)|layer(\d+))(?:\.|$)", layer_name)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
 def should_fake_quantize_layer(layer_name: str | None) -> bool:
     if not _RUNTIME_FAKE_QUANT_ENABLED:
         return False
     if not layer_name:
         return True
+    layer_index = _get_mxfp8_layer_index(layer_name)
+    if layer_index is not None and any(
+        start <= layer_index <= end for start, end in _RUNTIME_FALLBACK_LAYERS
+    ):
+        return False
     return not any(
         re.match(pattern[3:], layer_name) is not None if pattern.startswith("re:") else pattern in layer_name
         for pattern in _RUNTIME_IGNORE_PATTERNS

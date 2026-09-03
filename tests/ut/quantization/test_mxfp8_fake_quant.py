@@ -21,6 +21,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
                 "_RUNTIME_ROTATION",
                 "_RUNTIME_ROTATION_MATRIX",
                 "_RUNTIME_IGNORE_PATTERNS",
+                "_RUNTIME_FALLBACK_LAYERS",
                 "_RUNTIME_ROTATION_DEVICE_MATRICES",
             )
         }
@@ -42,6 +43,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": "7",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": '["Fprop"]',
             "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": "[]",
+            "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": "",
         }
         with patch.dict(os.environ, env, clear=False):
             fake_quant.initialize_mxfp8_fake_quant_config()
@@ -71,6 +73,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": "7",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": '["Dgrad", "Wgrad"]',
             "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": "[]",
+            "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": "",
         }
         with patch.dict(os.environ, env, clear=False):
             fake_quant.initialize_mxfp8_fake_quant_config()
@@ -78,3 +81,25 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
 
             self.assertIs(fake_quant._maybe_rotate(tensor), tensor)
             self.assertIsNone(fake_quant.warmup_mxfp8_rotation_matrix("cpu"))
+
+    def test_fallback_layers_skip_fake_quant_for_linear_and_moe_prefixes(self):
+        env = {
+            "VLLM_ASCEND_QAT_FAKE_QUANT": "1",
+            "VLLM_ASCEND_QAT_FAKE_QUANT_MODE": "w8a8_mxfp8",
+            "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
+            "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
+            "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "false",
+            "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": '["Fprop"]',
+            "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": "[]",
+            "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": "0-3,37-48",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            config = fake_quant.initialize_mxfp8_fake_quant_config()
+
+            self.assertEqual(config.fallback_layers, ((0, 3), (37, 48)))
+            self.assertFalse(fake_quant.should_fake_quantize_layer("model.layers.0.self_attn.q_proj"))
+            self.assertTrue(fake_quant.should_fake_quantize_layer("model.layers.4.self_attn.q_proj"))
+            self.assertFalse(fake_quant.should_fake_quantize_layer("model.layers.37.mlp.experts"))
+            self.assertFalse(fake_quant.should_fake_quantize_layer("model.layer48.mlp.down_proj"))
+            self.assertTrue(fake_quant.should_fake_quantize_layer("model.layers.49.mlp.down_proj"))

@@ -145,6 +145,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": lambda: os.getenv(
         "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS", "[]"
     ),
+    # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
+    "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": lambda: os.getenv(
+        "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS", ""
+    ),
 }
 
 # end-env-vars-definition
