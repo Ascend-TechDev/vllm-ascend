@@ -26,11 +26,11 @@ from typing import Any
 
 import torch
 
-MXFP8_ROTATION_ENABLE_KEY = "mxfp8_rotation_enable"
-MXFP8_ROTATION_KIND_KEY = "mxfp8_rotation_kind"
-MXFP8_ROTATION_BLOCK_SIZE_KEY = "mxfp8_rotation_block_size"
-MXFP8_ROTATION_SEED_KEY = "mxfp8_rotation_seed"
-MXFP8_ROTATION_TARGETS_KEY = "mxfp8_rotation_targets"
+MXFP8_ROTATION_ENABLE_KEY = "rotation_enable"
+MXFP8_ROTATION_KIND_KEY = "rotation_kind"
+MXFP8_ROTATION_BLOCK_SIZE_KEY = "rotation_block_size"
+MXFP8_ROTATION_SEED_KEY = "rotation_seed"
+MXFP8_ROTATION_TARGETS_KEY = "rotation_targets"
 
 MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN = "block_hadamard_sign"
 MXFP8_ROTATION_TARGET_FPROP = "fprop"
@@ -72,8 +72,7 @@ def normalize_mxfp8_rotation_kind(kind: str) -> str:
     normalized = str(kind).lower()
     if normalized not in _MXFP8_ROTATION_KIND_ALIASES:
         raise ValueError(
-            f"Unsupported MXFP8 rotation kind: {kind}. "
-            f"Supported kinds: {sorted(_MXFP8_ROTATION_KIND_ALIASES)}"
+            f"Unsupported MXFP8 rotation kind: {kind}. Supported kinds: {sorted(_MXFP8_ROTATION_KIND_ALIASES)}"
         )
     return _MXFP8_ROTATION_KIND_ALIASES[normalized]
 
@@ -103,8 +102,7 @@ def normalize_mxfp8_rotation_targets(targets: Any) -> tuple[str, ...]:
             targets = list(targets)
         else:
             raise TypeError(
-                f"MXFP8 rotation targets must be a list or comma-separated string, "
-                f"got {type(targets).__name__}"
+                f"MXFP8 rotation targets must be a list or comma-separated string, got {type(targets).__name__}"
             )
 
     normalized = set()
@@ -112,8 +110,7 @@ def normalize_mxfp8_rotation_targets(targets: Any) -> tuple[str, ...]:
         normalized_target = _MXFP8_ROTATION_TARGET_ALIASES.get(str(target).strip().lower())
         if normalized_target is None:
             raise ValueError(
-                f"Unsupported MXFP8 rotation target: {target}. "
-                f"Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
+                f"Unsupported MXFP8 rotation target: {target}. Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
             )
         normalized.add(normalized_target)
     return tuple(target for target in MXFP8_ROTATION_TARGET_ORDER if target in normalized)
@@ -124,9 +121,7 @@ def get_mxfp8_rotation_config(config: Mapping[str, Any] | None) -> MXFP8Rotation
         return MXFP8RotationConfig()
 
     enable = _coerce_bool(config.get(MXFP8_ROTATION_ENABLE_KEY, False))
-    kind = normalize_mxfp8_rotation_kind(
-        config.get(MXFP8_ROTATION_KIND_KEY, MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN)
-    )
+    kind = normalize_mxfp8_rotation_kind(config.get(MXFP8_ROTATION_KIND_KEY, MXFP8_ROTATION_KIND_BLOCK_HADAMARD_SIGN))
     return MXFP8RotationConfig(
         enable=enable,
         kind=kind,
@@ -141,9 +136,7 @@ def validate_mxfp8_rotation_config(config: MXFP8RotationConfig, group_size: int 
         return
     normalize_mxfp8_rotation_kind(config.kind)
     if config.block_size != group_size:
-        raise ValueError(
-            f"MXFP8 rotation block_size must match group_size={group_size}, got: {config.block_size}"
-        )
+        raise ValueError(f"MXFP8 rotation block_size must match group_size={group_size}, got: {config.block_size}")
     if config.block_size <= 0 or config.block_size & (config.block_size - 1):
         raise ValueError(f"MXFP8 Hadamard rotation requires a power-of-two block_size, got: {config.block_size}")
     targets = normalize_mxfp8_rotation_targets(config.targets)
@@ -157,8 +150,7 @@ def is_mxfp8_rotation_target(config: MXFP8RotationConfig | Mapping[str, Any], ta
     normalized_target = _MXFP8_ROTATION_TARGET_ALIASES.get(str(target).strip().lower())
     if normalized_target is None:
         raise ValueError(
-            f"Unsupported MXFP8 rotation target: {target}. "
-            f"Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
+            f"Unsupported MXFP8 rotation target: {target}. Supported targets: {list(MXFP8_ROTATION_TARGET_ORDER)}"
         )
     return bool(config.enable and normalized_target in normalize_mxfp8_rotation_targets(config.targets))
 

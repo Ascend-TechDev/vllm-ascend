@@ -113,7 +113,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable rollout-side MXFP8 fake quant/dequant in high-precision linear/MoE paths.
     # Used by low-precision RL rollout on devices without native MXFP8 kernels.
     "VLLM_ASCEND_QAT_FAKE_QUANT": lambda: bool(int(os.getenv("VLLM_ASCEND_QAT_FAKE_QUANT", "0"))),
-    # Fake quant mode: "w8a16_mxfp8" quantizes weights only; "w8a8_mxfp8" quantizes weights and activations.
+    # Modes: w8a16_mxfp8, w8a8_mxfp8, w4a8_mxfp4 (FP4/FP8), w4a4_mxfp4 (FP4/FP4).
     "VLLM_ASCEND_QAT_FAKE_QUANT_MODE": lambda: os.getenv("VLLM_ASCEND_QAT_FAKE_QUANT_MODE", "w8a8_mxfp8"),
     # MXFP8 backend recorded for compatibility with verl QAT config. Fake quant uses the torch formula.
     "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND", "torch"),
@@ -121,6 +121,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE", "rint"),
     # MXFP8 fake quant group size. The current implementation requires 32.
     "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": lambda: int(os.getenv("VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE", "32")),
+    # Non-sensitive JSON target list; Fprop controls rollout, Dgrad/Wgrad only affect training.
+    # The MXFP8 env prefix is retained for compatibility and also applies to MXFP4.
+    "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": lambda: os.getenv(
+        "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS", '["Fprop"]'
+    ),
     # Enable block-wise Hadamard/random-sign rotation before MXFP8 fake quant.
     "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": lambda: bool(
         os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE", "false").lower() in {"1", "true", "yes", "y", "on"}
@@ -134,21 +139,13 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE", "32")
     ),
     # Deterministic random-sign seed for MXFP8 rotation.
-    "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": lambda: int(
-        os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED", "0")
-    ),
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED": lambda: int(os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_SEED", "0")),
     # JSON-encoded MXFP8 rotation targets. Rollout uses Fprop; Dgrad/Wgrad are training-side targets.
-    "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": lambda: os.getenv(
-        "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS", '["Fprop"]'
-    ),
+    "VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_TARGETS", '["Fprop"]'),
     # JSON-encoded QAT ignore patterns copied from verl's effective QAT configuration.
-    "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": lambda: os.getenv(
-        "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS", "[]"
-    ),
+    "VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS", "[]"),
     # Inclusive transformer layer ranges to keep in high precision, e.g. "0-3,37-48".
-    "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": lambda: os.getenv(
-        "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS", ""
-    ),
+    "VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS", ""),
 }
 
 # end-env-vars-definition
