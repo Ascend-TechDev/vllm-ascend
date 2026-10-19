@@ -53,6 +53,10 @@ _MXFP8_HASH_INCREMENT = 1013904223
 _MXFP8_HASH_MODULUS = 2**32
 _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
+_MXFP4_EMAX = 2
+_MXFP4_MIN_PRIVATE_EXP = 0
+_MXFP4_MANTISSA_SCALE = 2.0
+_MXFP4_MAX_NORM = 6.0
 _MXFP8_FALLBACK_RANGE_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?$")
 _LOGGED_KEYS: set[tuple[Any, ...]] = set()
 _LOG_LOCK = threading.Lock()
@@ -452,30 +456,32 @@ def quantize_mxfp4_tensor(
     if str(quant_backend).lower() != "torch":
         raise ValueError("MXFP4 fake quantization requires quant_backend='torch'")
     rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
-    blocked = tensor.to(torch.float32).reshape(tensor.shape[0], tensor.shape[-1] // 32, 32)
+    blocked = tensor.to(torch.float32).reshape(
+        tensor.shape[0], tensor.shape[-1] // _MXFP8_BLOCK_SIZE, _MXFP8_BLOCK_SIZE
+    )
     amax = blocked.abs().amax(dim=-1)
     amax_safe = torch.where(amax == 0, torch.ones_like(amax), amax)
-    shared_exp = (torch.floor(torch.log2(amax_safe)) - 2.0).clamp(min=-127.0)
-    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -127.0), shared_exp)
-    shared_exp = torch.where(shared_exp > 127.0, torch.full_like(shared_exp, float("nan")), shared_exp)
-    normalized = blocked / torch.pow(2.0, shared_exp.unsqueeze(-1))
+    shared_exp = (torch.floor(torch.log2(amax_safe)) - _MXFP4_EMAX).clamp(min=-_MXFP8_SCALE_EMAX)
+    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -_MXFP8_SCALE_EMAX), shared_exp)
+    shared_exp = torch.where(shared_exp > _MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
+    # The inverse scale stays normal in FP32 even at E8M0 code 0.
+    normalized = blocked * torch.pow(2.0, -shared_exp.unsqueeze(-1))
     abs_norm = normalized.abs()
-    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float())).clamp(min=0)
+    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float())).clamp(min=_MXFP4_MIN_PRIVATE_EXP)
     private_scale = torch.pow(2.0, private_exp)
-    scaled = normalized / private_scale * 2.0
+    scaled = normalized / private_scale * _MXFP4_MANTISSA_SCALE
     quantized = torch.sign(scaled) * _round_mxfp8_scaled_abs(scaled.abs(), rounding_mode)
-    quantized = (quantized / 2.0 * private_scale).clamp(-6.0, 6.0)
+    quantized = (quantized / _MXFP4_MANTISSA_SCALE * private_scale).clamp(-_MXFP4_MAX_NORM, _MXFP4_MAX_NORM)
     # E8M0 code 255 denotes a non-finite block scale.
-    scale = torch.where(torch.isnan(shared_exp), torch.full_like(shared_exp, 255.0), shared_exp + 127.0)
+    scale = torch.where(torch.isnan(shared_exp), torch.full_like(shared_exp, 255.0), shared_exp + _MXFP8_SCALE_EMAX)
     return quantized.reshape_as(tensor), scale
 
 
 def dequantize_mxfp4_tensor(tensor_q: torch.Tensor, tensor_scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """Decode unpacked E2M1 values and E8M0 exponent codes."""
-    result = _dequantize_mxfp8(tensor_q, tensor_scale, dtype)
-    invalid_blocks = tensor_scale.reshape(tensor_q.shape[0], -1) == 255
-    invalid = invalid_blocks.unsqueeze(-1).expand(-1, -1, 32).reshape_as(tensor_q)
-    return torch.where(invalid, torch.full_like(result, float("nan")), result)
+    scale = tensor_scale.to(torch.float32)
+    scale = torch.where(scale == 255, torch.full_like(scale, float("nan")), scale)
+    return _dequantize_mxfp8(tensor_q, scale, dtype)
 
 
 def _fake_quantize_mxfp4_tensor(tensor: torch.Tensor, rounding_mode: str) -> torch.Tensor:

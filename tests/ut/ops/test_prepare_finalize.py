@@ -229,10 +229,10 @@ class TestPrepareAndFinalize(unittest.TestCase):
             quant_config=SimpleNamespace(
                 quant_description={
                     "group_size": 32,
-                    "mxfp8_rotation_enable": True,
-                    "mxfp8_rotation_kind": "block_hadamard_sign",
-                    "mxfp8_rotation_block_size": 32,
-                    "mxfp8_rotation_seed": 5,
+                    "rotation_enable": True,
+                    "rotation_kind": "block_hadamard_sign",
+                    "rotation_block_size": 32,
+                    "rotation_seed": 5,
                 }
             )
         )
