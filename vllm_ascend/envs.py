@@ -121,6 +121,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE", "rint"),
     # MXFP8 fake quant group size. The current implementation requires 32.
     "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": lambda: int(os.getenv("VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE", "32")),
+    # MXFP4 shared-scale algorithm: standard (0), tfs (1), or cx (2).
+    "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": lambda: os.getenv("VLLM_ASCEND_QAT_MXFP4_SCALE_ALG", "standard"),
     # Non-sensitive JSON target list; Fprop controls rollout, Dgrad/Wgrad only affect training.
     # The MXFP8 env prefix is retained for compatibility and also applies to MXFP4.
     "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": lambda: os.getenv(

@@ -17,6 +17,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
                 "_RUNTIME_FAKE_QUANT_TARGETS",
                 "_RUNTIME_QUANT_BACKEND",
                 "_RUNTIME_ROUNDING_MODE",
+                "_RUNTIME_MXFP4_SCALE_ALG",
                 "_RUNTIME_GROUP_SIZE",
                 "_RUNTIME_ROTATION_ENABLED",
                 "_RUNTIME_ROTATION",
@@ -42,6 +43,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "true",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -72,6 +74,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "true",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -94,6 +97,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -119,6 +123,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND": "torch",
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "hash",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
+            "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
             "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": '["Fprop"]',
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
@@ -187,6 +192,16 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
         payload, scale = fake_quant.quantize_mxfp4_tensor(torch.zeros(2, 96))
         self.assertTrue(torch.equal(scale, torch.zeros(2, 3)))
         self.assertTrue(torch.equal(fake_quant.dequantize_mxfp4_tensor(payload, scale, torch.float32), payload))
+
+    def test_mxfp4_scale_algorithms_use_expected_block_scale(self):
+        tensor = torch.full((1, 32), 7.0)
+        expected = {"standard": 127.0, "tfs": 128.0, "cx": 130.0}
+        for scale_alg, expected_scale in expected.items():
+            with self.subTest(scale_alg=scale_alg):
+                payload, scale = fake_quant.quantize_mxfp4_tensor(tensor, scale_alg=scale_alg)
+                self.assertEqual(scale.item(), expected_scale)
+                decoded = fake_quant.dequantize_mxfp4_tensor(payload, scale, tensor.dtype, scale_alg=scale_alg)
+                self.assertTrue(torch.isfinite(decoded).all())
 
     def test_mxfp4_rejects_native_backend_and_invalid_shapes(self):
         with self.assertRaisesRegex(ValueError, "quant_backend='torch'"):
