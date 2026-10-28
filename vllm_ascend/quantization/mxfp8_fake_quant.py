@@ -498,13 +498,11 @@ def quantize_mxfp4_tensor(
     elif scale_alg == "tfs":
         shared_exp = torch.ceil(torch.log2(amax_safe / _MXFP4_MAX_NORM))
     else:
-        shared_exp = torch.ceil(torch.log2(amax_safe))
+        shared_exp = torch.ceil(torch.log2(amax_safe / _MXFP4_CX_MAX_NORM))
     shared_exp = shared_exp.clamp(min=-_MXFP8_SCALE_EMAX)
     shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -_MXFP8_SCALE_EMAX), shared_exp)
     shared_exp = torch.where(shared_exp > _MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
     scale_factor = torch.pow(2.0, shared_exp)
-    if scale_alg == "cx":
-        scale_factor = scale_factor / _MXFP4_CX_MAX_NORM
     # The inverse scale stays normal in FP32 even at E8M0 code 0.
     normalized = blocked / scale_factor.unsqueeze(-1)
     abs_norm = normalized.abs()
@@ -529,8 +527,6 @@ def dequantize_mxfp4_tensor(
     scale = tensor_scale.to(torch.float32)
     scale = torch.where(scale == 255, torch.full_like(scale, float("nan")), scale)
     result = _dequantize_mxfp8(tensor_q, scale, torch.float32)
-    if scale_alg == "cx":
-        result = result / _MXFP4_CX_MAX_NORM
     return result.to(dtype)
 
 

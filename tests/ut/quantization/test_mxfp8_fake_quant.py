@@ -194,14 +194,20 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
         self.assertTrue(torch.equal(fake_quant.dequantize_mxfp4_tensor(payload, scale, torch.float32), payload))
 
     def test_mxfp4_scale_algorithms_use_expected_block_scale(self):
-        tensor = torch.full((1, 32), 7.0)
-        expected = {"standard": 127.0, "tfs": 128.0, "cx": 130.0}
-        for scale_alg, expected_scale in expected.items():
-            with self.subTest(scale_alg=scale_alg):
+        cases = [
+            ("standard", 7.0, 127.0, 6.0),
+            ("tfs", 7.0, 128.0, 8.0),
+            ("cx", 7.0, 127.0, 6.0),
+            ("cx", 8.0, 128.0, 8.0),
+            ("cx", 15.0, 129.0, 16.0),
+        ]
+        for scale_alg, value, expected_scale, expected_decoded in cases:
+            with self.subTest(scale_alg=scale_alg, value=value):
+                tensor = torch.full((1, 32), value)
                 payload, scale = fake_quant.quantize_mxfp4_tensor(tensor, scale_alg=scale_alg)
                 self.assertEqual(scale.item(), expected_scale)
                 decoded = fake_quant.dequantize_mxfp4_tensor(payload, scale, tensor.dtype, scale_alg=scale_alg)
-                self.assertTrue(torch.isfinite(decoded).all())
+                self.assertTrue(torch.equal(decoded, torch.full_like(tensor, expected_decoded)))
 
     def test_mxfp4_rejects_native_backend_and_invalid_shapes(self):
         with self.assertRaisesRegex(ValueError, "quant_backend='torch'"):
