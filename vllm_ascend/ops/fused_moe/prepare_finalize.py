@@ -36,9 +36,11 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
     get_mxfp8_rotation_config,
+    is_mxfp8_rotation_target,
     validate_mxfp8_rotation_config,
 )
 from vllm_ascend.quantization.quant_type import QuantType
@@ -60,15 +62,16 @@ def _maybe_apply_mxfp8_prepare_rotation(hidden_states: torch.Tensor, quant_type:
         return hidden_states
 
     rotation_config, quant_description = _get_runtime_mxfp8_rotation_config()
-    if not rotation_config.enable:
+    if not is_mxfp8_rotation_target(rotation_config, MXFP8_ROTATION_TARGET_FPROP):
         return hidden_states
 
     validate_mxfp8_rotation_config(rotation_config, group_size=quant_description.get("group_size", 32))
     logger.info_once(
-        "MXFP8 block rotation enabled for MoE prepare: kind=%s, block_size=%s, seed=%s",
+        "MXFP8 block rotation enabled for MoE prepare: kind=%s, block_size=%s, seed=%s, targets=%s",
         rotation_config.kind,
         rotation_config.block_size,
         rotation_config.seed,
+        rotation_config.targets,
     )
     return apply_mxfp8_block_rotation(hidden_states, rotation_config)
 

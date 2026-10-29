@@ -63,6 +63,10 @@ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8_ROTATION_TARGET_FPROP,
+    is_mxfp8_rotation_target,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -700,7 +704,12 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             fake_quant_config = getattr(self, "_mxfp8_fake_quant_config", None)
-            if fake_quant_config is not None and fake_quant_config.enable and fake_quant_config.rotation.enable:
+            if (
+                fake_quant_config is not None
+                and fake_quant_config.enable
+                and fake_quant_config.rotation.enable
+                and is_mxfp8_rotation_target(fake_quant_config.rotation, MXFP8_ROTATION_TARGET_FPROP)
+            ):
                 from vllm_ascend.quantization.mxfp8_fake_quant import warmup_mxfp8_rotation_matrix
 
                 warmup_mxfp8_rotation_matrix(self.device)
