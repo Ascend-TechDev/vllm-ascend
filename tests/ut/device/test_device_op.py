@@ -71,6 +71,86 @@ def test_kv_cache_load_makes_seq_lens_contiguous():
     assert mock_gather.call_args.kwargs["value"] is value
 
 
+def test_npu_fused_infer_attention_score_makes_kv_contiguous():
+    query = torch.randn(2, 3, 4)
+    key = torch.randn(2, 3, 4).transpose(0, 1)
+    value = torch.randn(2, 3, 4).transpose(0, 1)
+
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    with mock.patch(
+        "vllm_ascend.device.device_op.torch_npu.npu_fused_infer_attention_score",
+        return_value=(torch.empty_like(query), None),
+    ) as mock_fia:
+        BaseDeviceAdaptor.npu_fused_infer_attention_score(
+            query=query,
+            key=key,
+            value=value,
+            attn_metadata=object(),
+            key_cache=None,
+            value_cache=None,
+            current_key=key,
+            current_value=value,
+            num_heads=3,
+            num_key_value_heads=3,
+            head_size=4,
+            scale=0.125,
+            is_prefill_no_cache=False,
+            input_layout="TND",
+        )
+
+    mock_fia.assert_called_once()
+    call_kwargs = mock_fia.call_args.kwargs
+    assert call_kwargs["query"] is query
+    assert call_kwargs["key"] is not key
+    assert call_kwargs["value"] is not value
+    assert call_kwargs["key"].is_contiguous()
+    assert call_kwargs["value"].is_contiguous()
+    torch.testing.assert_close(call_kwargs["key"], key)
+    torch.testing.assert_close(call_kwargs["value"], value)
+
+
+def test_a5_npu_fused_infer_attention_score_makes_kv_contiguous():
+    query = torch.randn(2, 3, 4)
+    key = torch.randn(2, 3, 4).transpose(0, 1)
+    value = torch.randn(2, 3, 4).transpose(0, 1)
+
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    with mock.patch(
+        "vllm_ascend.device.device_op.torch_npu.npu_fused_infer_attention_score",
+        return_value=(torch.empty_like(query), None),
+    ) as mock_fia:
+        A5DeviceAdaptor.npu_fused_infer_attention_score(
+            query=query,
+            key=key,
+            value=value,
+            attn_metadata=object(),
+            key_cache=None,
+            value_cache=None,
+            current_key=key,
+            current_value=value,
+            num_heads=3,
+            num_key_value_heads=3,
+            head_size=4,
+            scale=0.125,
+            is_prefill_no_cache=False,
+            input_layout="TND",
+        )
+
+    mock_fia.assert_called_once()
+    call_kwargs = mock_fia.call_args.kwargs
+    assert call_kwargs["query"] is query
+    assert call_kwargs["key"] is not key
+    assert call_kwargs["value"] is not value
+    assert call_kwargs["key"].is_contiguous()
+    assert call_kwargs["value"].is_contiguous()
+    torch.testing.assert_close(call_kwargs["key"], key)
+    torch.testing.assert_close(call_kwargs["value"], value)
+
+
 def test_npu_flash_attention_uses_fusion_attention_for_fp32():
     query = torch.randn(5, 4, 64, dtype=torch.float32)
     key = torch.randn_like(query)

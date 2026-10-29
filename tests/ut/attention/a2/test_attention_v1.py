@@ -18,7 +18,7 @@ from vllm_ascend.attention.utils import (
     needs_layer_aware_fia_graph_replay,
     using_paged_attention,
 )
-from vllm_ascend.device.device_op import A5DeviceAdaptor
+from vllm_ascend.device.device_op import A5DeviceAdaptor, DeviceOperator
 from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
 from vllm_ascend.utils import AscendDeviceType
 
@@ -289,7 +289,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         )
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):
+    def test_large_head_prefill_uses_expected_device_operator_path(self, mock_get_forward_context):
         query = torch.randn(2, 8, FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE)
         key = torch.randn(2, 8, FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE)
         value = torch.randn(2, 8, FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE)
@@ -301,10 +301,18 @@ class TestAscendAttentionBackendImpl(TestBase):
         metadata.attn_mask = None
         mock_get_forward_context.return_value = MagicMock(capturing=False)
 
-        with patch(LARGE_HEAD_PREFILL_PATH, return_value=(torch.ones_like(query), None)) as mock_forward:
+        with (
+            patch(LARGE_HEAD_PREFILL_PATH, return_value=(torch.ones_like(query), None)) as mock_forward,
+            patch("torch_npu.npu_fused_infer_attention_score", return_value=(torch.ones_like(query), None)) as mock_fia,
+        ):
             result = self.impl_large_head.forward_impl(query, key, value, (), metadata, output)
 
-        mock_forward.assert_called_once()
+        if DeviceOperator is A5DeviceAdaptor:
+            mock_forward.assert_not_called()
+            mock_fia.assert_called_once()
+        else:
+            mock_forward.assert_called_once()
+            mock_fia.assert_not_called()
         self.assertIs(result, output)
         self.assertTrue(torch.equal(result, torch.ones_like(query)))
 
@@ -423,6 +431,8 @@ class TestAscendAttentionBackendImpl(TestBase):
         output = self.impl.forward(layer, query, key, value, kv_cache, metadata, output)
 
         mock_npu_fused_infer_attention_score.assert_called_once()
+        call_kwargs = mock_npu_fused_infer_attention_score.call_args.kwargs
+        assert call_kwargs["value"].is_contiguous()
         assert output.shape == (10, 8, 64)
 
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention")

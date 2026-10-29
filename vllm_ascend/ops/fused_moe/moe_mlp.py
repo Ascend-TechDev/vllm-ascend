@@ -14,10 +14,11 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
-
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.triton_utils import HAS_TRITON
 
@@ -28,6 +29,12 @@ from vllm_ascend.device.mxfp_compat import (
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.quantization.mxfp8_rotation import (
+    MXFP8RotationConfig,
+    apply_mxfp8_block_rotation,
+    get_mxfp8_rotation_config,
+    validate_mxfp8_rotation_config,
+)
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     dispose_tensor,
@@ -85,6 +92,71 @@ def _require_single_tensor_for_swiglu_quant(
     return tensor_or_list
 
 
+def _get_mxfp8_rotation_config() -> MXFP8RotationConfig:
+    try:
+        quant_config = getattr(get_current_vllm_config(), "quant_config", None)
+        quant_description = getattr(quant_config, "quant_description", {}) or {}
+    except Exception:
+        return MXFP8RotationConfig()
+    return get_mxfp8_rotation_config(quant_description)
+
+
+def _apply_rotated_mxfp8_swiglu_quant(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    group_list: torch.Tensor,
+    group_list_type: int,
+    pertoken_scale: torch.Tensor,
+    input_hidden_dtype: torch.dtype,
+    act_quant_type: torch.dtype,
+    weight_quant_type: torch.dtype,
+    scale_type: torch.dtype | None,
+    per_token_scale_type: torch.dtype | None,
+    use_bf16: bool,
+    activation: str | None,
+    swiglu_limit: int,
+    rotation_config: MXFP8RotationConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gmm1_kwargs = DeviceOperator.get_quant_gmm2_kwargs(
+        input_dtype=input_hidden_dtype,
+        act_quant_type=act_quant_type,
+        weight_quant_type=weight_quant_type,
+        scale_type=scale_type,
+        per_token_scale_type=per_token_scale_type,
+        use_bf16=use_bf16,
+        use_mxfp_quant=True,
+    )
+    output_dtype = gmm1_kwargs.pop("output_dtype")
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w1],
+        scale=[w1_scale],
+        bias=None,
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=group_list_type,
+        group_type=0,
+        group_list=group_list,
+        output_dtype=output_dtype,
+        **gmm1_kwargs,
+    )[0]
+    if activation == MoEActivation.SWIGLUSTEP:
+        hidden_states = AscendSwigluStepAndMul.swiglustep_forward(hidden_states, limit=swiglu_limit or 7.0)
+    else:
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+    if rotation_config.enable:
+        hidden_states = apply_mxfp8_block_rotation(hidden_states, rotation_config)
+    hidden_states, swiglu_out_scale = DeviceOperator.npu_dynamic_quant(
+        hidden_states=hidden_states,
+        dynamic_scale=None,
+        act_quant_type=act_quant_type,
+        use_mxfp_quant=True,
+    )
+    return hidden_states, swiglu_out_scale
+
+
 def quant_apply_mlp(
     hidden_states: torch.Tensor,
     w1: list[torch.Tensor] | torch.Tensor,
@@ -113,6 +185,8 @@ def quant_apply_mlp(
 ) -> torch.Tensor:
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
+    rotation_config = MXFP8RotationConfig()
+    rotate_mxfp8_swiglu = False
 
     if use_mxfp_quant:
         ensure_mxfp8_moe_available("MXFP MoE MLP path")
@@ -121,6 +195,19 @@ def quant_apply_mlp(
             raise NotImplementedError("MXFP path does not support scale_bias yet.")
         if w1_offset is not None or w2_offset is not None:
             raise NotImplementedError("MXFP path does not support antiquant offset yet.")
+        if act_quant_type == torch.float8_e4m3fn:
+            rotation_config = _get_mxfp8_rotation_config()
+            if rotation_config.enable:
+                validate_mxfp8_rotation_config(rotation_config)
+                rotate_mxfp8_swiglu = True
+                use_gmm_swiglu_quant_fusion = False
+                logger.info_once(
+                    "MXFP8 block rotation enabled for MoE SwigLU output; "
+                    "using split GMM1/SwiGLU/rotation/quant path: kind=%s, block_size=%s, seed=%s",
+                    rotation_config.kind,
+                    rotation_config.block_size,
+                    rotation_config.seed,
+                )
 
     if w1_offset is not None:
         unquantized_hidden_states = hidden_states
@@ -177,6 +264,26 @@ def quant_apply_mlp(
                 weight_quant_type=weight_quant_type,
                 swiglu_limit=swiglu_limit,
                 mxfp_quant_dtype=mxfp_quant_dtype,
+            )
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+        elif rotate_mxfp8_swiglu:
+            hidden_states, swiglu_out_scale = _apply_rotated_mxfp8_swiglu_quant(
+                hidden_states=hidden_states,
+                w1=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
+                w1_scale=_require_single_tensor_for_swiglu_quant(w1_scale, name="w1_scale"),
+                group_list=group_list,
+                group_list_type=group_list_type,
+                pertoken_scale=pertoken_scale,
+                input_hidden_dtype=input_hidden_dtype,
+                act_quant_type=act_quant_type,
+                weight_quant_type=weight_quant_type,
+                scale_type=scale_type,
+                per_token_scale_type=per_token_scale_type,
+                use_bf16=use_bf16,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                rotation_config=rotation_config,
             )
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
@@ -305,6 +412,26 @@ def quant_apply_mlp(
                 weight_quant_type=weight_quant_type,
                 swiglu_limit=swiglu_limit,
                 mxfp_quant_dtype=mxfp_quant_dtype,
+            )
+            if quantized_hidden_states is not None:
+                dispose_tensor(quantized_hidden_states)
+        elif rotate_mxfp8_swiglu:
+            hidden_states, swiglu_out_scale = _apply_rotated_mxfp8_swiglu_quant(
+                hidden_states=hidden_states,
+                w1=_require_single_tensor_for_swiglu_quant(w1, name="w1"),
+                w1_scale=_require_single_tensor_for_swiglu_quant(w1_scale, name="w1_scale"),
+                group_list=group_list,
+                group_list_type=group_list_type,
+                pertoken_scale=pertoken_scale,
+                input_hidden_dtype=input_hidden_dtype,
+                act_quant_type=act_quant_type,
+                weight_quant_type=weight_quant_type,
+                scale_type=scale_type,
+                per_token_scale_type=per_token_scale_type,
+                use_bf16=use_bf16,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                rotation_config=rotation_config,
             )
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
