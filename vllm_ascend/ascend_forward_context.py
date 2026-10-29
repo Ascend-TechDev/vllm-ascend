@@ -12,6 +12,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context, set_forwa
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.quantization.mxfp8_fake_quant import is_mxfp8_fake_quant_enabled
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -259,6 +260,11 @@ def _select_a3_moe_comm_method(
     mc2_tokens_capacity: int,
     enable_fused_mc2: int,
 ) -> MoECommType:
+    if is_mxfp8_fake_quant_enabled():
+        # Fused MC2 executes the whole expert MLP in one low-level operator and
+        # cannot expose the high-precision QDQ points used by rollout fake QAT.
+        return MoECommType.MC2 if num_tokens <= mc2_tokens_capacity else MoECommType.ALLTOALL
+
     # TODO: drop the EP-size guard when dispatch_ffn_combine supports larger EP sizes
     # TODO: drop speculative method guard when dispatch_gmm_combine_decode supports w16a16
     dispatch_ffn_combine_enable = get_ep_group().world_size <= 32

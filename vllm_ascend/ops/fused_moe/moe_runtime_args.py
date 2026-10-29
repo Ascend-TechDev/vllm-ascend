@@ -147,6 +147,7 @@ def build_fused_experts_input(
     w1_offset: torch.Tensor | None = None,
     w2_offset: torch.Tensor | None = None,
     swiglu_limit: float | None = 0.0,
+    fake_quant_enabled: bool = False,
     lora_context=None,
 ) -> MoEFusedExpertsInput:
     if not vllm_version_is("0.23.0") and swiglu_limit is None:
@@ -194,6 +195,7 @@ def build_fused_experts_input(
             is_per_channel_weight=is_per_channel_weight,
         ),
         swiglu_limit=swiglu_limit,
+        fake_quant_enabled=fake_quant_enabled,
         lora_context=lora_context,
     )
 
@@ -245,6 +247,7 @@ def build_mlp_compute_input(
         need_trans=fused_experts_input.need_trans,
         dynamic_eplb=fused_experts_input.dynamic_eplb,
         swiglu_limit=fused_experts_input.swiglu_limit,
+        fake_quant_enabled=fused_experts_input.fake_quant_enabled,
         expanded_row_idx=expanded_row_idx,
         topk_ids=fused_experts_input.topk_ids,
         lora_context=fused_experts_input.lora_context,

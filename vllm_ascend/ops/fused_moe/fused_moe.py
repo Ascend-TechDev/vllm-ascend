@@ -42,6 +42,10 @@ from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_expe
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
+from vllm_ascend.quantization.mxfp8_fake_quant import (
+    is_mxfp8_fake_quant_enabled,
+    should_fake_quantize_layer,
+)
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
@@ -124,8 +128,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # ND format (or other formats), remove this specific 'if' check and the forced
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
+        fake_quant_enabled = is_mxfp8_fake_quant_enabled() and should_fake_quantize_layer(
+            getattr(layer, "prefix", "")
+        )
+        layer._mxfp8_fake_quant_enabled = fake_quant_enabled
+        if fake_quant_enabled:
+            logger.warning_once(
+                "MXFP8 rollout fake quant is active for high-precision MoE layers; "
+                "MoE layers will apply torch quantize/dequantize to expert weights and activations "
+                "before NPU grouped matmul.",
+            )
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if enable_fused_mc2:
+        if enable_fused_mc2 and not fake_quant_enabled:
             layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
             layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
             if enable_fused_mc2 == 1 and self.dynamic_eplb:
@@ -135,8 +149,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 del layer.w2_weight
                 torch.npu.empty_cache()
         else:
-            layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
-            layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+            if not fake_quant_enabled:
+                layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+                layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
 
     def apply(
         self,
@@ -162,6 +177,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         pertoken_scale: torch.Tensor | None = None,
         mc2_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        fake_quant_enabled = getattr(layer, "_mxfp8_fake_quant_enabled", False)
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         input_ids = getattr(get_forward_context(), "input_ids", None)
@@ -234,7 +250,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w13_weight_list = getattr(layer, "w13_weight_list", None)
         w2_weight_list = getattr(layer, "w2_weight_list", None)
         has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and not fake_quant_enabled:
             if self.dynamic_eplb and not has_split_weight_lists:
                 logger.warning_once(
                     "FUSED_MC2 is enabled with dynamic EPLB, but unquantized MoE weights are not split into "
@@ -277,6 +293,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                fake_quant_enabled=fake_quant_enabled,
                 # Per-layer MoE LoRA state, set once by AscendFusedMoEWithLoRA
                 # when an adapter wraps this layer; None for non-LoRA layers.
                 lora_context=getattr(layer, "_ascend_moe_lora_context", None),

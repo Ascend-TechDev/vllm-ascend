@@ -29,6 +29,10 @@ from vllm_ascend.device.mxfp_compat import (
 )
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
+from vllm_ascend.quantization.mxfp8_fake_quant import (
+    fake_quant_mxfp8_activation,
+    fake_quant_mxfp8_transposed_moe_weight,
+)
 from vllm_ascend.quantization.mxfp8_rotation import (
     MXFP8RotationConfig,
     apply_mxfp8_block_rotation,
@@ -500,6 +504,7 @@ def unquant_apply_mlp(
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
     swiglu_limit: float = 0.0,
+    fake_quant_enabled: bool = False,
     lora_context=None,
     expanded_row_idx: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
@@ -507,6 +512,13 @@ def unquant_apply_mlp(
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
+
+    if fake_quant_enabled:
+        hidden_states = fake_quant_mxfp8_activation(hidden_states)
+        # vLLM's unquantized grouped matmul stores expert weights as [E, K, N],
+        # while verl QAT quantizes canonical linear weights as [E, N, K].
+        w1 = fake_quant_mxfp8_transposed_moe_weight(w1)
+        w2 = fake_quant_mxfp8_transposed_moe_weight(w2)
 
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -559,6 +571,9 @@ def unquant_apply_mlp(
             gate.clamp_(max=swiglu_limit)
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+
+    if fake_quant_enabled:
+        gate_up_out = fake_quant_mxfp8_activation(gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
@@ -624,6 +639,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
             topk_scales=topk_scales,
             need_trans=need_trans,
             swiglu_limit=swiglu_limit,
+            fake_quant_enabled=mlp_compute_input.fake_quant_enabled,
             lora_context=mlp_compute_input.lora_context,
             expanded_row_idx=mlp_compute_input.expanded_row_idx,
             topk_ids=mlp_compute_input.topk_ids,
