@@ -53,6 +53,20 @@ _MXFP8_HASH_INCREMENT = 1013904223
 _MXFP8_HASH_MODULUS = 2**32
 _MXFP8_HASH_RANDOM_SHIFT = 2**8
 _MXFP8_HASH_RANDOM_LEVELS = 2**24
+_MXFP4_EMAX = 2
+_MXFP4_MIN_PRIVATE_EXP = 0
+_MXFP4_MANTISSA_SCALE = 2.0
+_MXFP4_MAX_NORM = 6.0
+_MXFP4_CX_MAX_NORM = 7.25
+_MXFP4_SCALE_ALIASES = {
+    "standard": "standard",
+    "ocp": "standard",
+    "0": "standard",
+    "tfs": "tfs",
+    "1": "tfs",
+    "cx": "cx",
+    "2": "cx",
+}
 _MXFP8_FALLBACK_RANGE_RE = re.compile(r"^(\d+)(?:\s*-\s*(\d+))?$")
 _LOGGED_KEYS: set[tuple[Any, ...]] = set()
 _LOG_LOCK = threading.Lock()
@@ -61,6 +75,7 @@ _RUNTIME_FAKE_QUANT_ENABLED = False
 _RUNTIME_MODE = "w8a8_mxfp8"
 _RUNTIME_QUANT_BACKEND = "torch"
 _RUNTIME_ROUNDING_MODE = "rint"
+_RUNTIME_MXFP4_SCALE_ALG = "standard"
 _RUNTIME_GROUP_SIZE = _MXFP8_BLOCK_SIZE
 _RUNTIME_ROTATION_ENABLED = False
 _RUNTIME_ROTATION = MXFP8RotationConfig()
@@ -69,6 +84,7 @@ _RUNTIME_ROTATION_DEVICE_MATRICES: dict[tuple[str, torch.dtype], torch.Tensor] =
 _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK = threading.Lock()
 _RUNTIME_IGNORE_PATTERNS: tuple[str, ...] = ()
 _RUNTIME_FALLBACK_LAYERS: tuple[tuple[int, int], ...] = ()
+_RUNTIME_FAKE_QUANT_TARGETS: tuple[str, ...] = ("fprop",)
 _WEIGHT_FAKE_QUANT_CACHE_EPOCH = 0
 _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS = 0
 _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS = 0
@@ -85,10 +101,12 @@ class MXFP8FakeQuantConfig:
     rotation: MXFP8RotationConfig
     ignore_patterns: tuple[str, ...]
     fallback_layers: tuple[tuple[int, int], ...]
+    fake_quant_targets: tuple[str, ...] = ("fprop",)
+    mxfp4_scale_alg: str = "standard"
 
     @property
     def quantize_activation(self) -> bool:
-        return self.mode == "w8a8_mxfp8"
+        return self.mode != "w8a16_mxfp8"
 
 
 def _log_once(key: tuple[Any, ...], message: str, *args):
@@ -108,9 +126,19 @@ def normalize_mxfp8_rounding_mode(rounding_mode: str) -> str:
     return rounding_mode
 
 
+def normalize_mxfp4_scale_alg(scale_alg: str) -> str:
+    key = str(scale_alg).strip().lower()
+    try:
+        return _MXFP4_SCALE_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported MXFP4 scale algorithm: {scale_alg!r}. Expected standard, tfs, or cx"
+        ) from exc
+
+
 def normalize_mxfp8_fake_quant_mode(mode: str) -> str:
     mode = str(mode).lower()
-    if mode not in {"w8a16_mxfp8", "w8a8_mxfp8"}:
+    if mode not in {"w8a16_mxfp8", "w8a8_mxfp8", "w4a8_mxfp4", "w4a4_mxfp4"}:
         raise ValueError(f"Unsupported MXFP8 fake quant mode: {mode}")
     return mode
 
@@ -176,6 +204,7 @@ def normalize_mxfp8_fallback_layers(value: Any) -> tuple[tuple[int, int], ...]:
 def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     mode = normalize_mxfp8_fake_quant_mode(envs.VLLM_ASCEND_QAT_FAKE_QUANT_MODE)
     rounding_mode = normalize_mxfp8_rounding_mode(envs.VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE)
+    mxfp4_scale_alg = normalize_mxfp4_scale_alg(envs.VLLM_ASCEND_QAT_MXFP4_SCALE_ALG)
     quant_backend = str(envs.VLLM_ASCEND_QAT_MXFP8_QUANT_BACKEND).lower()
     if quant_backend not in {"torch", "npu"}:
         raise ValueError(f"Unsupported MXFP8 fake quant backend: {quant_backend}")
@@ -204,6 +233,8 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     if not all(isinstance(pattern, str) for pattern in ignore_patterns):
         raise ValueError("VLLM_ASCEND_QAT_MXFP8_IGNORE_PATTERNS must contain only strings")
     fallback_layers = normalize_mxfp8_fallback_layers(envs.VLLM_ASCEND_QAT_MXFP8_FALLBACK_LAYERS)
+    if mode in {"w4a8_mxfp4", "w4a4_mxfp4"} and quant_backend != "torch":
+        raise ValueError("MXFP4 fake quantization requires quant_backend='torch'")
     return MXFP8FakeQuantConfig(
         enable=bool(envs.VLLM_ASCEND_QAT_FAKE_QUANT),
         mode=mode,
@@ -213,6 +244,8 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         rotation=rotation,
         ignore_patterns=ignore_patterns,
         fallback_layers=fallback_layers,
+        fake_quant_targets=normalize_mxfp8_rotation_targets(envs.VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS),
+        mxfp4_scale_alg=mxfp4_scale_alg,
     )
 
 
@@ -222,6 +255,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     global _RUNTIME_MODE
     global _RUNTIME_QUANT_BACKEND
     global _RUNTIME_ROUNDING_MODE
+    global _RUNTIME_MXFP4_SCALE_ALG
     global _RUNTIME_GROUP_SIZE
     global _RUNTIME_ROTATION_ENABLED
     global _RUNTIME_ROTATION
@@ -229,31 +263,33 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     global _RUNTIME_ROTATION_DEVICE_MATRICES
     global _RUNTIME_IGNORE_PATTERNS
     global _RUNTIME_FALLBACK_LAYERS
+    global _RUNTIME_FAKE_QUANT_TARGETS
 
     config = _read_mxfp8_fake_quant_config()
     _RUNTIME_FAKE_QUANT_ENABLED = config.enable
     _RUNTIME_MODE = config.mode
     _RUNTIME_QUANT_BACKEND = config.quant_backend
     _RUNTIME_ROUNDING_MODE = config.rounding_mode
+    _RUNTIME_MXFP4_SCALE_ALG = config.mxfp4_scale_alg
     _RUNTIME_GROUP_SIZE = config.group_size
     _RUNTIME_ROTATION_ENABLED = is_mxfp8_rotation_target(config.rotation, MXFP8_ROTATION_TARGET_FPROP)
     _RUNTIME_ROTATION = config.rotation
     _RUNTIME_IGNORE_PATTERNS = config.ignore_patterns
     _RUNTIME_FALLBACK_LAYERS = config.fallback_layers
-    _RUNTIME_ROTATION_MATRIX = (
-        _build_block_rotation_matrix(config.rotation) if _RUNTIME_ROTATION_ENABLED else None
-    )
+    _RUNTIME_FAKE_QUANT_TARGETS = config.fake_quant_targets
+    _RUNTIME_ROTATION_MATRIX = _build_block_rotation_matrix(config.rotation) if _RUNTIME_ROTATION_ENABLED else None
     with _RUNTIME_ROTATION_DEVICE_MATRICES_LOCK:
         _RUNTIME_ROTATION_DEVICE_MATRICES = {}
     logger.warning(
         "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
-        "group_size=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
+        "group_size=%s, mxfp4_scale_alg=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
         "rotation_block_size=%s, rotation_seed=%s, fallback_layers=%s",
         config.enable,
         config.mode,
         config.quant_backend,
         config.rounding_mode,
         config.group_size,
+        config.mxfp4_scale_alg,
         config.rotation.enable,
         config.rotation.targets,
         config.rotation.kind,
@@ -274,6 +310,8 @@ def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         rotation=_RUNTIME_ROTATION,
         ignore_patterns=_RUNTIME_IGNORE_PATTERNS,
         fallback_layers=_RUNTIME_FALLBACK_LAYERS,
+        fake_quant_targets=_RUNTIME_FAKE_QUANT_TARGETS,
+        mxfp4_scale_alg=_RUNTIME_MXFP4_SCALE_ALG,
     )
 
 
@@ -313,8 +351,7 @@ def _record_weight_fake_quant_refresh(layer_kind: str):
 
 def log_mxfp8_weight_fake_quant_cache_refresh(reason: str | None = None):
     logger.warning(
-        "MXFP8 rollout fake quant weight cache refreshed: layers=%s, linear_layers=%s, moe_layers=%s, "
-        "epoch=%s%s",
+        "MXFP8 rollout fake quant weight cache refreshed: layers=%s, linear_layers=%s, moe_layers=%s, epoch=%s%s",
         _WEIGHT_FAKE_QUANT_REFRESHED_LAYERS,
         _WEIGHT_FAKE_QUANT_REFRESHED_LINEAR_LAYERS,
         _WEIGHT_FAKE_QUANT_REFRESHED_MOE_LAYERS,
@@ -336,9 +373,7 @@ def should_fake_quantize_layer(layer_name: str | None) -> bool:
     if not layer_name:
         return True
     layer_index = _get_mxfp8_layer_index(layer_name)
-    if layer_index is not None and any(
-        start <= layer_index <= end for start, end in _RUNTIME_FALLBACK_LAYERS
-    ):
+    if layer_index is not None and any(start <= layer_index <= end for start, end in _RUNTIME_FALLBACK_LAYERS):
         return False
     return not any(
         re.match(pattern[3:], layer_name) is not None if pattern.startswith("re:") else pattern in layer_name
@@ -436,6 +471,74 @@ def _fake_quantize_mxfp8_tensor(tensor: torch.Tensor, rounding_mode: str) -> tor
     return _dequantize_mxfp8(tensor_q, tensor_scale, tensor.dtype).reshape(original_shape)
 
 
+def quantize_mxfp4_tensor(
+    tensor: torch.Tensor,
+    quant_backend: str = "torch",
+    rounding_mode: str = "rint",
+    scale_alg: str = "standard",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP4 E2M1 payload and biased E8M0 exponents, both stored in FP32.
+
+    Follows ops-nn DynamicMxQuant (scale_alg=0): 32-element blocks,
+    emax=2, minimum private exponent=0, one mantissa bit, saturation at 6.
+    No packed FP4/device cast is needed for immediate fake dequantization.
+    """
+    _check_mxfp8_2d_tensor(tensor)
+    if str(quant_backend).lower() != "torch":
+        raise ValueError("MXFP4 fake quantization requires quant_backend='torch'")
+    rounding_mode = normalize_mxfp8_rounding_mode(rounding_mode)
+    scale_alg = normalize_mxfp4_scale_alg(scale_alg)
+    blocked = tensor.to(torch.float32).reshape(
+        tensor.shape[0], tensor.shape[-1] // _MXFP8_BLOCK_SIZE, _MXFP8_BLOCK_SIZE
+    )
+    amax = blocked.abs().amax(dim=-1)
+    amax_safe = torch.where(amax == 0, torch.ones_like(amax), amax)
+    if scale_alg == "standard":
+        shared_exp = torch.floor(torch.log2(amax_safe)) - _MXFP4_EMAX
+    elif scale_alg == "tfs":
+        shared_exp = torch.ceil(torch.log2(amax_safe / _MXFP4_MAX_NORM))
+    else:
+        shared_exp = torch.ceil(torch.log2(amax_safe / _MXFP4_CX_MAX_NORM))
+    shared_exp = shared_exp.clamp(min=-_MXFP8_SCALE_EMAX)
+    shared_exp = torch.where(amax == 0, torch.full_like(shared_exp, -_MXFP8_SCALE_EMAX), shared_exp)
+    shared_exp = torch.where(shared_exp > _MXFP8_SCALE_EMAX, torch.full_like(shared_exp, float("nan")), shared_exp)
+    scale_factor = torch.pow(2.0, shared_exp)
+    # The inverse scale stays normal in FP32 even at E8M0 code 0.
+    normalized = blocked / scale_factor.unsqueeze(-1)
+    abs_norm = normalized.abs()
+    private_exp = torch.floor(torch.log2(abs_norm + (abs_norm == 0).float())).clamp(min=_MXFP4_MIN_PRIVATE_EXP)
+    private_scale = torch.pow(2.0, private_exp)
+    scaled = normalized / private_scale * _MXFP4_MANTISSA_SCALE
+    quantized = torch.sign(scaled) * _round_mxfp8_scaled_abs(scaled.abs(), rounding_mode)
+    quantized = (quantized / _MXFP4_MANTISSA_SCALE * private_scale).clamp(-_MXFP4_MAX_NORM, _MXFP4_MAX_NORM)
+    # E8M0 code 255 denotes a non-finite block scale.
+    scale = torch.where(torch.isnan(shared_exp), torch.full_like(shared_exp, 255.0), shared_exp + _MXFP8_SCALE_EMAX)
+    return quantized.reshape_as(tensor), scale
+
+
+def dequantize_mxfp4_tensor(
+    tensor_q: torch.Tensor,
+    tensor_scale: torch.Tensor,
+    dtype: torch.dtype,
+    scale_alg: str = "standard",
+) -> torch.Tensor:
+    """Decode unpacked E2M1 values and E8M0 exponent codes."""
+    scale_alg = normalize_mxfp4_scale_alg(scale_alg)
+    scale = tensor_scale.to(torch.float32)
+    scale = torch.where(scale == 255, torch.full_like(scale, float("nan")), scale)
+    result = _dequantize_mxfp8(tensor_q, scale, torch.float32)
+    return result.to(dtype)
+
+
+def _fake_quantize_mxfp4_tensor(
+    tensor: torch.Tensor, rounding_mode: str, scale_alg: str = "standard"
+) -> torch.Tensor:
+    original_shape = tensor.shape
+    tensor_2d = tensor.reshape(-1, tensor.shape[-1])
+    payload, scale = quantize_mxfp4_tensor(tensor_2d, rounding_mode=rounding_mode, scale_alg=scale_alg)
+    return dequantize_mxfp4_tensor(payload, scale, tensor.dtype, scale_alg=scale_alg).reshape(original_shape)
+
+
 def _get_runtime_rotation_matrix(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if _RUNTIME_ROTATION_MATRIX is None:
         raise RuntimeError("MXFP8 rotation matrix is not initialized")
@@ -462,9 +565,7 @@ def warmup_mxfp8_rotation_matrix(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor | None:
     """Materialize the rollout rotation matrix on a worker device."""
-    if not _RUNTIME_ROTATION_ENABLED or not is_mxfp8_rotation_target(
-        _RUNTIME_ROTATION, MXFP8_ROTATION_TARGET_FPROP
-    ):
+    if not _RUNTIME_ROTATION_ENABLED or not is_mxfp8_rotation_target(_RUNTIME_ROTATION, MXFP8_ROTATION_TARGET_FPROP):
         return None
     if _RUNTIME_ROTATION_MATRIX is None:
         raise RuntimeError("MXFP8 rotation matrix is not initialized")
@@ -504,6 +605,10 @@ def fake_quant_mxfp8_weight(tensor: torch.Tensor) -> torch.Tensor:
     if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
     tensor = _maybe_rotate(tensor)
+    if "fprop" not in _RUNTIME_FAKE_QUANT_TARGETS:
+        return tensor
+    if _RUNTIME_MODE in {"w4a8_mxfp4", "w4a4_mxfp4"}:
+        return _fake_quantize_mxfp4_tensor(tensor, _RUNTIME_ROUNDING_MODE, _RUNTIME_MXFP4_SCALE_ALG)
     return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
 
 
@@ -511,8 +616,10 @@ def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
     if not _RUNTIME_FAKE_QUANT_ENABLED:
         return tensor
     tensor = _maybe_rotate(tensor)
-    if _RUNTIME_MODE != "w8a8_mxfp8":
+    if _RUNTIME_MODE == "w8a16_mxfp8" or "fprop" not in _RUNTIME_FAKE_QUANT_TARGETS:
         return tensor
+    if _RUNTIME_MODE == "w4a4_mxfp4":
+        return _fake_quantize_mxfp4_tensor(tensor, "rint", _RUNTIME_MXFP4_SCALE_ALG)
     return _fake_quantize_mxfp8_tensor(tensor, "rint")
 
 

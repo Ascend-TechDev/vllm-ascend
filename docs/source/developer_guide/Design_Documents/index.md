@@ -16,5 +16,6 @@ add_custom_aclnn_op
 context_parallel
 dynamic_chunked_pipeline_parallel
 quantization
+mxfp_qat_fake_quant
 npugraph_ex
 :::
