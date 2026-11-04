@@ -44,8 +44,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
 from vllm_ascend.quantization.mxfp8_fake_quant import (
     ensure_mxfp8_linear_weight_fake_quantized,
-    fake_quant_mxfp8_activation,
     is_mxfp8_fake_quant_enabled,
+    prepare_mxfp8_activation,
     should_fake_quantize_layer,
 )
 from vllm_ascend.utils import (
@@ -121,9 +121,13 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        residual = None
         if getattr(layer, "_mxfp8_fake_quant_enabled", False):
-            x = fake_quant_mxfp8_activation(x)
-        return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
+            x, residual = prepare_mxfp8_activation(x)
+        output = torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
+        if residual is not None:
+            output = output + torch.ops.vllm.unquantized_gemm(residual, layer.weight, None)
+        return output
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group

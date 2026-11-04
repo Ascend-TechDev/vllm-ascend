@@ -428,13 +428,18 @@ class MatmulAllreduceRowParallelOp(CustomRowParallelOp):
         """Calculate the output tensor of forward by considering
         fusing communication and computation."""
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if self.reduce_results and self.tp_size > 1:
+        # Fused matmul/communication skips quant_method.apply and its A QDQ.
+        # Both ablation settings must use the same A8 baseline and collective.
+        fake_quant_enabled = getattr(self.layer, "_mxfp8_fake_quant_enabled", False)
+        if self.reduce_results and self.tp_size > 1 and not fake_quant_enabled:
             output = torch_npu.npu_mm_all_reduce_base(
                 input_parallel, self.layer.weight.t(), self.hcomm_info, bias=bias_
             )
         else:
             assert self.quant_method is not None
             output = self.quant_method.apply(self.layer, input_parallel, bias=bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = self.comm_group.all_reduce(output)
 
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
@@ -565,7 +570,8 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         from vllm_ascend.quantization.methods import AscendW8A8LinearMethod
 
         # For unquant
-        if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod):
+        fake_quant_enabled = getattr(self.layer, "_mxfp8_fake_quant_enabled", False)
+        if mmrs_fusion and isinstance(self.layer.quant_method, UnquantizedLinearMethod) and not fake_quant_enabled:
             output = torch_npu.npu_mm_reduce_scatter_base(
                 x,
                 self.layer.weight.t(),

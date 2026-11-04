@@ -30,7 +30,7 @@ from vllm_ascend.device.mxfp_compat import (
 from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEMlpComputeInput
 from vllm_ascend.quantization.mxfp8_fake_quant import (
-    fake_quant_mxfp8_activation,
+    prepare_mxfp8_activation,
 )
 from vllm_ascend.quantization.mxfp8_rotation import (
     MXFP8_ROTATION_TARGET_FPROP,
@@ -515,8 +515,9 @@ def unquant_apply_mlp(
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
 
+    input_residual = None
     if fake_quant_enabled:
-        hidden_states = fake_quant_mxfp8_activation(hidden_states)
+        hidden_states, input_residual = prepare_mxfp8_activation(hidden_states)
 
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -527,6 +528,17 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
+    if input_residual is not None:
+        gate_up_out = gate_up_out + torch_npu.npu_grouped_matmul(
+            x=[input_residual],
+            weight=[w1],
+            bias=None,
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+        )[0]
 
     # MoE LoRA: only attempt injection when an adapter wraps this layer and the
     # comm method provided AllGather routing metadata (expanded_row_idx). Lazy
@@ -570,11 +582,14 @@ def unquant_apply_mlp(
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
+    down_residual = None
     if fake_quant_enabled:
-        gate_up_out = fake_quant_mxfp8_activation(gate_up_out)
+        gate_up_out, down_residual = prepare_mxfp8_activation(gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
+        if down_residual is not None:
+            down_residual = down_residual * topk_scales
 
     hidden_states = torch_npu.npu_grouped_matmul(
         x=[gate_up_out],
@@ -585,6 +600,17 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
+
+    if down_residual is not None:
+        hidden_states = hidden_states + torch_npu.npu_grouped_matmul(
+            x=[down_residual],
+            weight=[w2],
+            bias=None,
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+        )[0]
 
     # LoRA w2 delta: applied to the down-proj output, with the activation output
     # as the lora_a input. Reuses the per-row routing computed for w13.

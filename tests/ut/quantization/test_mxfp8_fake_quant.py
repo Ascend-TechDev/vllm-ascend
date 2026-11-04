@@ -13,6 +13,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             name: getattr(fake_quant, name)
             for name in (
                 "_RUNTIME_FAKE_QUANT_ENABLED",
+                "_RUNTIME_CONFIG",
                 "_RUNTIME_MODE",
                 "_RUNTIME_FAKE_QUANT_TARGETS",
                 "_RUNTIME_QUANT_BACKEND",

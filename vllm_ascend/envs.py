@@ -128,6 +128,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": lambda: os.getenv(
         "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS", '["Fprop"]'
     ),
+    # Non-sensitive boolean, default false. Add the full floating-point activation
+    # residual with a second GEMM/GMM; applies to both MXFP8 and MXFP4 fake quant.
+    "VLLM_ASCEND_QAT_MXFP8_ACTIVATION_RESIDUAL_FPROP": lambda: os.getenv(
+        "VLLM_ASCEND_QAT_MXFP8_ACTIVATION_RESIDUAL_FPROP", "false"
+    ).lower() in {"1", "true", "yes", "y", "on"},
     # Enable block-wise Hadamard/random-sign rotation before MXFP8 fake quant.
     "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": lambda: bool(
         os.getenv("VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE", "false").lower() in {"1", "true", "yes", "y", "on"}

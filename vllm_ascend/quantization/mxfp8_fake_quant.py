@@ -103,10 +103,16 @@ class MXFP8FakeQuantConfig:
     fallback_layers: tuple[tuple[int, int], ...]
     fake_quant_targets: tuple[str, ...] = ("fprop",)
     mxfp4_scale_alg: str = "standard"
+    activation_residual_fprop: bool = False
 
     @property
     def quantize_activation(self) -> bool:
         return self.mode != "w8a16_mxfp8"
+
+
+# Store the parsed immutable configuration once, before graph capture. Forward
+# paths must not read the environment or create mutable configuration caches.
+_RUNTIME_CONFIG: MXFP8FakeQuantConfig | None = None
 
 
 def _log_once(key: tuple[Any, ...], message: str, *args):
@@ -246,6 +252,7 @@ def _read_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         fallback_layers=fallback_layers,
         fake_quant_targets=normalize_mxfp8_rotation_targets(envs.VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS),
         mxfp4_scale_alg=mxfp4_scale_alg,
+        activation_residual_fprop=bool(envs.VLLM_ASCEND_QAT_MXFP8_ACTIVATION_RESIDUAL_FPROP),
     )
 
 
@@ -264,8 +271,10 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     global _RUNTIME_IGNORE_PATTERNS
     global _RUNTIME_FALLBACK_LAYERS
     global _RUNTIME_FAKE_QUANT_TARGETS
+    global _RUNTIME_CONFIG
 
     config = _read_mxfp8_fake_quant_config()
+    _RUNTIME_CONFIG = config
     _RUNTIME_FAKE_QUANT_ENABLED = config.enable
     _RUNTIME_MODE = config.mode
     _RUNTIME_QUANT_BACKEND = config.quant_backend
@@ -283,7 +292,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
     logger.warning(
         "MXFP8 rollout fake quant initialized: enable=%s, mode=%s, quant_backend=%s, rounding_mode=%s, "
         "group_size=%s, mxfp4_scale_alg=%s, rotation_enable=%s, rotation_targets=%s, rotation_kind=%s, "
-        "rotation_block_size=%s, rotation_seed=%s, fallback_layers=%s",
+        "rotation_block_size=%s, rotation_seed=%s, fallback_layers=%s, activation_residual_fprop=%s",
         config.enable,
         config.mode,
         config.quant_backend,
@@ -296,6 +305,7 @@ def initialize_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         config.rotation.block_size,
         config.rotation.seed,
         config.fallback_layers,
+        config.activation_residual_fprop,
     )
     return config
 
@@ -312,11 +322,27 @@ def get_mxfp8_fake_quant_config() -> MXFP8FakeQuantConfig:
         fallback_layers=_RUNTIME_FALLBACK_LAYERS,
         fake_quant_targets=_RUNTIME_FAKE_QUANT_TARGETS,
         mxfp4_scale_alg=_RUNTIME_MXFP4_SCALE_ALG,
+        activation_residual_fprop=bool(_RUNTIME_CONFIG and _RUNTIME_CONFIG.activation_residual_fprop),
     )
 
 
 def is_mxfp8_fake_quant_enabled() -> bool:
     return _RUNTIME_FAKE_QUANT_ENABLED
+
+
+def is_mxfp8_activation_residual_enabled() -> bool:
+    """Whether Fprop uses full activation residual compensation.
+
+    This switch is independent of the QDQ targets: if Fprop QDQ is disabled,
+    Ar-Aq is zero and callers still execute the extra matrix multiplication.
+    W8A16 has no activation quantization and is outside the compensated modes.
+    """
+    return bool(
+        _RUNTIME_FAKE_QUANT_ENABLED
+        and _RUNTIME_CONFIG
+        and _RUNTIME_CONFIG.activation_residual_fprop
+        and _RUNTIME_MODE != "w8a16_mxfp8"
+    )
 
 
 def invalidate_mxfp8_weight_fake_quant_cache(reason: str | None = None):
@@ -612,15 +638,34 @@ def fake_quant_mxfp8_weight(tensor: torch.Tensor) -> torch.Tensor:
     return _fake_quantize_mxfp8_tensor(tensor, _RUNTIME_ROUNDING_MODE)
 
 
-def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
-    if not _RUNTIME_FAKE_QUANT_ENABLED:
-        return tensor
-    tensor = _maybe_rotate(tensor)
+def _fake_quantize_activation(tensor: torch.Tensor) -> torch.Tensor:
+    """Quantize an activation already expressed in the weight's coordinates."""
     if _RUNTIME_MODE == "w8a16_mxfp8" or "fprop" not in _RUNTIME_FAKE_QUANT_TARGETS:
         return tensor
     if _RUNTIME_MODE == "w4a4_mxfp4":
         return _fake_quantize_mxfp4_tensor(tensor, "rint", _RUNTIME_MXFP4_SCALE_ALG)
     return _fake_quantize_mxfp8_tensor(tensor, "rint")
+
+
+def fake_quant_mxfp8_activation(tensor: torch.Tensor) -> torch.Tensor:
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return tensor
+    return _fake_quantize_activation(_maybe_rotate(tensor))
+
+
+def prepare_mxfp8_activation(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return Aq and, when enabled, the full Ar-Aq residual in the same dtype.
+
+    Ar is the rotated input when rotation is enabled. The residual is neither
+    quantized nor selected, and is retained even when all its values are zero.
+    Callers use the same cached Wq for both independent matrix multiplications.
+    """
+    if not _RUNTIME_FAKE_QUANT_ENABLED:
+        return tensor, None
+    activation = _maybe_rotate(tensor)
+    quantized = _fake_quantize_activation(activation)
+    residual = activation - quantized if is_mxfp8_activation_residual_enabled() else None
+    return quantized, residual
 
 
 def fake_quant_mxfp8_transposed_moe_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -759,6 +804,8 @@ __all__ = [
     "ensure_mxfp8_linear_weight_fake_quantized",
     "ensure_mxfp8_moe_weight_fake_quantized",
     "fake_quant_mxfp8_activation",
+    "prepare_mxfp8_activation",
+    "is_mxfp8_activation_residual_enabled",
     "fake_quant_mxfp8_transposed_moe_weight",
     "fake_quant_mxfp8_transposed_moe_weight_list",
     "fake_quant_mxfp8_weight",
