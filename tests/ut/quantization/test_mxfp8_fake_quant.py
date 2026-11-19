@@ -18,6 +18,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
                 "_RUNTIME_QUANT_BACKEND",
                 "_RUNTIME_ROUNDING_MODE",
                 "_RUNTIME_MXFP4_SCALE_ALG",
+                "_RUNTIME_MXFP4_MBS_ENABLE",
                 "_RUNTIME_GROUP_SIZE",
                 "_RUNTIME_ROTATION_ENABLED",
                 "_RUNTIME_ROTATION",
@@ -44,6 +45,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
             "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
+            "VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "true",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -75,6 +77,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
             "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
+            "VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "true",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -98,6 +101,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "rint",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
             "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
+            "VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_BLOCK_SIZE": "32",
@@ -124,6 +128,7 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
             "VLLM_ASCEND_QAT_MXFP8_ROUNDING_MODE": "hash",
             "VLLM_ASCEND_QAT_MXFP8_GROUP_SIZE": "32",
             "VLLM_ASCEND_QAT_MXFP4_SCALE_ALG": "standard",
+            "VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_FAKE_QUANT_TARGETS": '["Fprop"]',
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_ENABLE": "false",
             "VLLM_ASCEND_QAT_MXFP8_ROTATION_KIND": "block_hadamard_sign",
@@ -154,6 +159,29 @@ class TestMXFP8FakeQuantRotation(unittest.TestCase):
                 torch.testing.assert_close(fake_quant.fake_quant_mxfp8_activation(tensor), expected_input)
                 self.assertFalse(fake_quant.should_fake_quantize_layer("model.layers.1.mlp.experts"))
                 self.assertTrue(fake_quant.should_fake_quantize_layer("model.layers.2.mlp.experts"))
+
+    def test_mxfp4_mbs_matches_macroblock_qdq_with_inverse_correction(self):
+        self._configure_mxfp4("w4a4_mxfp4", VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE="true")
+        tensor = torch.linspace(-3.8, 4.0, 128, dtype=torch.float32).reshape(1, 128).to(torch.bfloat16)
+
+        scaled = tensor.to(torch.float32) * 1.5
+        expected_activation = (fake_quant._fake_quantize_mxfp4_tensor(scaled, "rint") / 1.5).to(tensor.dtype)
+        expected_weight = (fake_quant._fake_quantize_mxfp4_tensor(scaled, "hash") / 1.5).to(tensor.dtype)
+
+        self.assertTrue(fake_quant.get_mxfp8_fake_quant_config().mxfp4_mbs_enable)
+        self.assertEqual(fake_quant.fake_quant_mxfp8_activation(tensor).dtype, tensor.dtype)
+        torch.testing.assert_close(fake_quant.fake_quant_mxfp8_activation(tensor), expected_activation)
+        torch.testing.assert_close(fake_quant.fake_quant_mxfp8_weight(tensor), expected_weight)
+
+    def test_mxfp4_mbs_rejects_unsupported_mode_and_scale_algorithm(self):
+        with self.assertRaisesRegex(ValueError, "requires an MXFP4 fake quant mode"):
+            self._configure_mxfp4("w8a8_mxfp8", VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE="true")
+        with self.assertRaisesRegex(ValueError, "mxfp4_scale_alg='standard'"):
+            self._configure_mxfp4(
+                "w4a4_mxfp4",
+                VLLM_ASCEND_QAT_MXFP4_MBS_ENABLE="true",
+                VLLM_ASCEND_QAT_MXFP4_SCALE_ALG="cx",
+            )
 
     def test_mxfp4_rotation_and_transposed_moe_weight_cache(self):
         from types import SimpleNamespace
